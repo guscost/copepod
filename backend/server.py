@@ -15,7 +15,7 @@ os.environ["DISABLE_XFORMERS"] = "1"
 os.environ.setdefault("USE_CHUNKWISE_GDN", "1")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from diffusion import DPMS
+from diffusion import DPMSolverMultistepScheduler
 from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae, vae_decode, vae_encode
 from diffusion.model.utils import get_weight_dtype
 from diffusion.utils.config import model_v2v_init_config
@@ -57,7 +57,7 @@ class SANAStreamingPipeline:
         self.model = build_model(config, device)
         self.vae = get_vae(config.vae, device)
         self.tokenizer, self.text_encoder = get_tokenizer_and_text_encoder(config.text_encoder, device)
-        self.scheduler = DPMS.DPMSolverMultistepScheduler(
+        self.scheduler = DPMSolverMultistepScheduler(
             num_train_timesteps=config.scheduler.num_train_timesteps,
             beta_schedule=config.scheduler.beta_schedule,
             prediction_type=config.scheduler.prediction_type,
