@@ -9,3 +9,5 @@ transformers==4.46.0
 diffusers==0.31.0
 accelerate==0.34.0
 xformers==0.0.28
+pyrallis
+termcolor
