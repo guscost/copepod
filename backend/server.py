@@ -32,35 +32,49 @@ os.environ["DISABLE_XFORMERS"] = "1"
 os.environ.setdefault("USE_CHUNKWISE_GDN", "1")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import torch
-import torchvision.transforms as T
-from PIL import Image, ImageOps
-
 BACKEND_ROOT = Path(__file__).resolve().parent
-SANA_ROOT = BACKEND_ROOT / "Sana-main"
-if SANA_ROOT.is_dir() and str(SANA_ROOT) not in sys.path:
+# The Sana repo is not tracked in this repository; it must exist locally.
+# Override with the SANA_ROOT environment variable if it lives elsewhere.
+SANA_ROOT = Path(os.environ.get("SANA_ROOT", BACKEND_ROOT / "Sana-main")).resolve()
+if (SANA_ROOT / "diffusion").is_dir() and str(SANA_ROOT) not in sys.path:
     sys.path.insert(0, str(SANA_ROOT))
 
-import diffusion.model.nets  # noqa: F401, E402  (registers model/attention classes)
-import pyrallis  # noqa: E402
-from diffusers import FlowMatchEulerDiscreteScheduler  # noqa: E402
-from diffusers.models.modeling_outputs import Transformer2DModelOutput  # noqa: E402
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
+try:
+    import torch
+    import torchvision.transforms as T
+    from PIL import Image, ImageOps
 
-from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae  # noqa: E402
-from diffusion.model.ltx2.streaming_decoder import CausalVaeStreamingDecoder  # noqa: E402
-from diffusion.model.utils import get_weight_dtype  # noqa: E402
-from diffusion.scheduler.sana_streaming_sampler import SANAStreamingSampler  # noqa: E402
-from diffusion.utils.config import (  # noqa: E402
-    AEConfig,
-    ModelVideoConfig,
-    SchedulerConfig,
-    TextEncoderConfig,
-    model_v2v_init_config,
-)
-from tools.download import find_model  # noqa: E402
+    import diffusion.model.nets  # noqa: F401  (registers model/attention classes)
+    import pyrallis
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+
+    from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae
+    from diffusion.model.ltx2.streaming_decoder import CausalVaeStreamingDecoder
+    from diffusion.model.utils import get_weight_dtype
+    from diffusion.scheduler.sana_streaming_sampler import SANAStreamingSampler
+    from diffusion.utils.config import (
+        AEConfig,
+        ModelVideoConfig,
+        SchedulerConfig,
+        TextEncoderConfig,
+        model_v2v_init_config,
+    )
+    from tools.download import find_model
+except ModuleNotFoundError as e:
+    raise SystemExit(
+        f"Failed to import the SANA-Streaming stack: {e}\n\n"
+        "Setup:\n"
+        f"  1. The Sana repo must exist at {SANA_ROOT}\n"
+        "     (clone it there, or point the SANA_ROOT env var at it).\n"
+        "  2. Install Sana's dependencies (Python 3.11, CUDA toolkit):\n"
+        "       cd backend/Sana-main && bash environment_setup.sh\n"
+        "     or minimally:  pip install -e backend/Sana-main\n"
+        "  3. Install the server deps:  pip install -r backend/requirements.txt"
+    ) from e
 
 STREAMING_REPO_ID = "Efficient-Large-Model/SANA-Streaming"
 DEFAULT_PROMPT = "Replace all corporate logos, and all still or video advertising, with black squares"

@@ -11,11 +11,28 @@ Real-time video-to-video style transformation using SANA-Streaming with FastAPI 
 ## Setup
 
 ### Backend
+The backend wraps the Sana repo, which is **not** tracked in this repository —
+clone it into `backend/Sana-main` first (or set the `SANA_ROOT` env var to its
+location):
+
 ```bash
 cd backend
+git clone <sana-repo-url> Sana-main   # if not already present
+
+# Install the Sana environment (Python 3.11 + CUDA; installs torch 2.9,
+# flash-linear-attention, flash-attn, etc.). See Sana-main/environment_setup.sh.
+cd Sana-main
+bash environment_setup.sh sana   # creates/uses a conda env named "sana"
+cd ..
+
+# Then install the server-only deps and run:
 pip install -r requirements.txt
 python server.py
 ```
+
+Note: install Sana's dependencies *before* `requirements.txt`, and don't pin
+torch/diffusers/transformers yourself — versions must match
+`Sana-main/pyproject.toml`.
 
 ### Frontend
 Open `frontend/index.html` in a browser, or serve it:

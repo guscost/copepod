@@ -1,13 +1,11 @@
-fastapi==0.115.0
-uvicorn==0.30.0
-websockets==12.0
-torch==2.5.0
-torchvision==0.20.0
-Pillow==10.4.0
-numpy==1.26.4
-transformers==4.46.0
-diffusers==0.31.0
-accelerate==0.34.0
-xformers==0.0.28
+# Server-only dependencies. The ML stack (torch, diffusers, transformers,
+# accelerate, xformers, flash-linear-attention, ...) is provided by the Sana
+# repo in Sana-main — install it FIRST with Sana's environment_setup.sh or
+# `pip install -e Sana-main`. Do not re-pin torch/diffusers here; the versions
+# must match Sana's pyproject.toml.
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=12
+Pillow>=10.4
 pyrallis
 termcolor
