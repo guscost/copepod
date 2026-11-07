@@ -275,6 +275,7 @@ class SANAStreamingPipeline:
         )
 
         # The LTX2VAE_chunk_tile loader enables temporal chunk tiling itself.
+        print("[load] Loading VAE (Lightricks/LTX-2)...", flush=True)
         self.vae = get_vae(
             config.vae.vae_type,
             config.vae.vae_pretrained,
@@ -283,11 +284,13 @@ class SANAStreamingPipeline:
             config=config.vae,
         )
 
+        print("[load] VAE loaded. Loading text encoder (gemma-2-2b-it)...", flush=True)
         self.tokenizer, self.text_encoder = get_tokenizer_and_text_encoder(
             config.text_encoder.text_encoder_name,
             device=self.device,
         )
 
+        print("[load] Text encoder loaded. Building DiT model...", flush=True)
         latent_size = config.model.image_size // config.vae.vae_downsample_rate
         model_kwargs = model_v2v_init_config(config, latent_size=latent_size)
         self.model = build_model(
@@ -296,6 +299,7 @@ class SANAStreamingPipeline:
             **model_kwargs,
         ).to(self.device)
 
+        print("[load] DiT built. Downloading/loading checkpoint...", flush=True)
         model_path = f"hf://{STREAMING_REPO_ID}/dit/sana_streaming_ar.pth"
         state_dict = find_model(model_path)
         if "generator" in state_dict:
@@ -313,9 +317,10 @@ class SANAStreamingPipeline:
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval().to(self.weight_dtype)
 
+        print("[load] Weights loaded. Encoding prompt (first GPU compute)...", flush=True)
         self.set_prompt(self.prompt)
 
-        print("SANA-Streaming model loaded successfully.")
+        print("SANA-Streaming model loaded successfully.", flush=True)
 
     def _encode_prompt(self, prompt: str, use_chi_prompt: bool = True):
         """Encode a text prompt, mirroring the reference inference script."""
