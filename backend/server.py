@@ -313,7 +313,14 @@ class SANAStreamingPipeline:
             **model_kwargs,
         ).to(self.device)
 
-        print("[load] DiT built. Downloading/loading checkpoint...", flush=True)
+        from diffusion.utils.import_utils import is_flash_attn_available
+
+        print(
+            f"[load] DiT built (flash_attn={is_flash_attn_available()}, "
+            f"chunkwise_gdn={os.environ.get('USE_CHUNKWISE_GDN', '1')}). "
+            "Downloading/loading checkpoint...",
+            flush=True,
+        )
         model_path = f"hf://{STREAMING_REPO_ID}/dit/sana_streaming_ar.pth"
         state_dict = find_model(model_path)
         if "generator" in state_dict:

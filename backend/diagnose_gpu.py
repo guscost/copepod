@@ -8,8 +8,27 @@ Usage:
     python diagnose_gpu.py            # all stages
     python diagnose_gpu.py stress     # pure torch compute stress only
 
+Useful A/B runs when hunting a kernel-level hang (a whole-machine crash that
+survives power/clock caps is usually a wedged CUDA/Triton kernel, not watts):
+
+    CUDA_LAUNCH_BLOCKING=1 python diagnose_gpu.py
+        Makes every kernel launch synchronous, so the last printed line really
+        is the crashing stage (async launches can misattribute the crash to a
+        later stage).
+
+    DISABLE_FLASH_ATTN=1 python diagnose_gpu.py
+        Routes the softmax attention layers through PyTorch SDPA instead of
+        the flash-attn CUDA kernels. If the crash disappears, flash-attn
+        (mis)built for your GPU arch is the culprit; run the server with
+        DISABLE_FLASH_ATTN=1 too.
+
 Watch power draw in another terminal while it runs:
     watch -n0.5 nvidia-smi --query-gpu=power.draw,temperature.gpu --format=csv
+
+After any crash, check the kernel log from the previous boot:
+    journalctl -k -b -1 | grep -i xid
+Xid 13/31 = a kernel faulted (software); Xid 74 "GPU has fallen off the bus"
+= hardware (connector/riser/PSU) despite power limits.
 """
 
 import os
@@ -108,6 +127,10 @@ def main():
     torch.cuda.empty_cache()
 
     stage("Stage 5: one DiT forward (triton GDN kernels compile + run here)")
+    from diffusion.utils.import_utils import is_flash_attn_available, is_xformers_available
+    print(f"  attention backend: flash_attn={is_flash_attn_available()} "
+          f"xformers={is_xformers_available()} "
+          f"chunkwise_gdn={os.environ.get('USE_CHUNKWISE_GDN', '1')}", flush=True)
     cond = torch.randn(1, 300, h.shape[-1], device=device, dtype=weight_dtype)
     noise = torch.randn(1, config.vae.vae_latent_dim, 4, FRAME_HEIGHT // 32, FRAME_WIDTH // 32,
                         device=device, dtype=weight_dtype)
