@@ -150,6 +150,9 @@ def main():
           f"xformers={is_xformers_available()} "
           f"chunkwise_gdn={os.environ.get('USE_CHUNKWISE_GDN', '1')}", flush=True)
     cond = torch.randn(1, 300, h.shape[-1], device=device, dtype=weight_dtype)
+    # The model raises "Attention type is not available" when mask=None and
+    # xformers is disabled; the server always passes the prompt mask (B, L).
+    mask = torch.ones(1, 300, device=device, dtype=torch.long)
     noise = torch.randn(1, config.vae.vae_latent_dim, 4, FRAME_HEIGHT // 32, FRAME_WIDTH // 32,
                         device=device, dtype=weight_dtype)
     src = torch.randn_like(noise).to(vae_dtype)
@@ -157,7 +160,7 @@ def main():
     with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
         out, _ = model(noise, t, cond, start_f=0, end_f=4, frame_index=None,
                        save_kv_cache=True, kv_cache=[[None] * 6 for _ in model.blocks],
-                       mask=None, data_info={"image_vae_embeds": src})
+                       mask=mask, data_info={"image_vae_embeds": src})
     print(f"  output shape: {tuple(out.shape)}", flush=True)
 
     stage("ALL STAGES PASSED")
