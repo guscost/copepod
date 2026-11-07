@@ -34,6 +34,30 @@ Note: install Sana's dependencies *before* `requirements.txt`, and don't pin
 torch/diffusers/transformers yourself — versions must match
 `Sana-main/pyproject.toml`.
 
+### Reducing GPU load / power draw
+
+If the machine crashes or reboots when processing starts (a classic symptom of
+transient power spikes, e.g. on an RTX 5090), the backend exposes env-var
+knobs to lighten the per-frame and sustained load:
+
+```bash
+# 480p instead of 720p: ~2x less DiT/VAE work per chunk
+FRAME_WIDTH=832 FRAME_HEIGHT=480 python server.py
+
+# Half the denoising steps (2 instead of 4)
+DENOISE_STEPS=2 python server.py
+
+# Process every other input frame (halves sustained processing framerate)
+FRAME_SKIP=2 python server.py
+```
+
+`FRAME_WIDTH`/`FRAME_HEIGHT` must both be divisible by 32. The knobs combine
+freely. The most direct fix for power-spike crashes, though, is capping the
+card's power limit, e.g. `nvidia-smi -pl 400` — often sufficient on its own.
+
+To confirm which stage over-stresses the machine, run
+`python diagnose_gpu.py` and watch `nvidia-smi` power draw in parallel.
+
 ### Frontend
 Open `frontend/index.html` in a browser, or serve it:
 ```bash

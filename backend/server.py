@@ -80,10 +80,19 @@ STREAMING_REPO_ID = "Efficient-Large-Model/SANA-Streaming"
 DEFAULT_PROMPT = "Replace all corporate logos, and all still or video advertising, with black squares"
 CONFIG_PATH = BACKEND_ROOT / "sana_streaming_2b_720p.yaml"
 
-# 720p training bucket; both dims must be divisible by the VAE spatial stride
-# (32), which 1280x720 is not.
-FRAME_WIDTH, FRAME_HEIGHT = 1280, 704
-DENOISE_STEPS = 4  # long_streaming mode default
+# Load knobs (env-overridable). Lower these if the GPU/PSU can't sustain the
+# load — e.g. transient power spikes on an RTX 5090 can trip the whole machine:
+#   FRAME_WIDTH=832 FRAME_HEIGHT=480   # 480p bucket, ~2x less DiT/VAE work
+#   DENOISE_STEPS=2                    # halves DiT cost per chunk
+#   FRAME_SKIP=2                       # process 1 of every 2 input frames
+# Both frame dims must be divisible by the VAE spatial stride (32), which
+# 1280x720 is not.
+FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1280"))
+FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "704"))
+DENOISE_STEPS = int(os.environ.get("DENOISE_STEPS", "4"))  # long_streaming default
+# Process only every Nth input frame; skipped frames are answered with the
+# last output, lowering the sustained processing framerate.
+FRAME_SKIP = max(1, int(os.environ.get("FRAME_SKIP", "1")))
 JPEG_QUALITY = 80
 # If the GPU falls behind by more than this many unprocessed input frames,
 # drop the oldest ones (a jump cut) instead of growing latency without bound.
@@ -265,6 +274,11 @@ class SANAStreamingPipeline:
         self.vae_dtype = get_weight_dtype(config.vae.weight_dtype)
         self.vae_stride = config.vae.vae_stride
 
+        if FRAME_WIDTH % self.vae_stride[2] or FRAME_HEIGHT % self.vae_stride[1]:
+            raise ValueError(
+                f"FRAME_WIDTH ({FRAME_WIDTH}) and FRAME_HEIGHT ({FRAME_HEIGHT}) must be "
+                f"divisible by the VAE spatial stride ({self.vae_stride[2]}x{self.vae_stride[1]})"
+            )
         self.latent_h = FRAME_HEIGHT // self.vae_stride[1]
         self.latent_w = FRAME_WIDTH // self.vae_stride[2]
 
@@ -458,6 +472,7 @@ class StreamSession:
         self.decoder = VaeStreamingDecoder(p.vae)
         self.encoder_fresh = True  # reset the VAE encoder cache on next encode
         self.stream_started = False
+        self.frames_seen = 0  # input frames received, for FRAME_SKIP pacing
 
     def drop_oldest_if_overwhelmed(self) -> int:
         excess = len(self.frame_buffer) - MAX_PENDING_FRAMES
@@ -556,12 +571,14 @@ def _ingest_frame(data: bytes) -> bytes:
     global session
     if session is None:
         session = StreamSession(pipeline)
-    frame = pipeline.preprocess_frame(Image.open(io.BytesIO(data)))
-    session.frame_buffer.append(frame)
-    dropped = session.drop_oldest_if_overwhelmed()
-    if dropped:
-        print(f"Backpressure: dropped {dropped} stale input frame(s)")
-    session.advance()
+    session.frames_seen += 1
+    if (session.frames_seen - 1) % FRAME_SKIP == 0:
+        frame = pipeline.preprocess_frame(Image.open(io.BytesIO(data)))
+        session.frame_buffer.append(frame)
+        dropped = session.drop_oldest_if_overwhelmed()
+        if dropped:
+            print(f"Backpressure: dropped {dropped} stale input frame(s)")
+        session.advance()
     return session.next_output()
 
 

@@ -61,7 +61,7 @@ def main():
     from diffusion.model.utils import get_weight_dtype
     from diffusion.utils.config import model_v2v_init_config
     from tools.download import find_model
-    from server import CONFIG_PATH, STREAMING_REPO_ID, StreamingInferenceConfig
+    from server import CONFIG_PATH, FRAME_HEIGHT, FRAME_WIDTH, STREAMING_REPO_ID, StreamingInferenceConfig
 
     config = pyrallis.parse(config_class=StreamingInferenceConfig, config_path=str(CONFIG_PATH), args=[])
     device = torch.device("cuda")
@@ -70,9 +70,9 @@ def main():
 
     stage("Stage 1: load VAE (Lightricks/LTX-2)")
     vae = get_vae(config.vae.vae_type, config.vae.vae_pretrained, device=device, dtype=vae_dtype, config=config.vae)
-    stage("Stage 1b: VAE encode one 1280x704 frame")
+    stage(f"Stage 1b: VAE encode one {FRAME_WIDTH}x{FRAME_HEIGHT} frame")
     from torchvision import transforms as T
-    img = torch.rand(1, 3, 1, 704, 1280, device=device, dtype=vae_dtype) * 2 - 1
+    img = torch.rand(1, 3, 1, FRAME_HEIGHT, FRAME_WIDTH, device=device, dtype=vae_dtype) * 2 - 1
     out = vae.streaming_causal_encode(img, causal=True, reset_cache=True).latent_dist.mode()
     print(f"  latent shape: {tuple(out.shape)}", flush=True)
 
@@ -109,7 +109,7 @@ def main():
 
     stage("Stage 5: one DiT forward (triton GDN kernels compile + run here)")
     cond = torch.randn(1, 300, h.shape[-1], device=device, dtype=weight_dtype)
-    noise = torch.randn(1, config.vae.vae_latent_dim, 4, 704 // 32, 1280 // 32,
+    noise = torch.randn(1, config.vae.vae_latent_dim, 4, FRAME_HEIGHT // 32, FRAME_WIDTH // 32,
                         device=device, dtype=weight_dtype)
     src = torch.randn_like(noise).to(vae_dtype)
     t = torch.tensor([500], device=device)
