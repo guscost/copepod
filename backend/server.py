@@ -24,6 +24,7 @@ import sys
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +107,29 @@ class StreamingInferenceConfig:
     text_encoder: TextEncoderConfig
     scheduler: SchedulerConfig
     work_dir: str = "output"
+
+
+def load_text_encoder(name: str, device, attn_implementation: str):
+    """Gemma text encoder load with an explicit attention backend.
+
+    Mirrors the gemma branch of Sana's ``get_tokenizer_and_text_encoder`` but
+    passes ``attn_implementation`` through, so a crashing default backend
+    (e.g. SDPA/flash-attn on a brand-new GPU arch) can be swapped for
+    ``eager`` via the TEXT_ENCODER_ATTN env var.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_id = name if "/" in name else f"Efficient-Large-Model/{name}"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.padding_side = "right"
+    text_encoder = (
+        AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, attn_implementation=attn_implementation
+        )
+        .get_decoder()
+        .to(device)
+    )
+    return tokenizer, text_encoder
 
 
 class IncrementalStreamingSampler(SANAStreamingSampler):
@@ -299,10 +323,17 @@ class SANAStreamingPipeline:
         )
 
         print("[load] VAE loaded. Loading text encoder (gemma-2-2b-it)...", flush=True)
-        self.tokenizer, self.text_encoder = get_tokenizer_and_text_encoder(
-            config.text_encoder.text_encoder_name,
-            device=self.device,
-        )
+        text_encoder_attn = os.environ.get("TEXT_ENCODER_ATTN")  # eager|sdpa|flash_attention_2
+        if text_encoder_attn:
+            print(f"[load] Text encoder attn_implementation={text_encoder_attn}", flush=True)
+            self.tokenizer, self.text_encoder = load_text_encoder(
+                config.text_encoder.text_encoder_name, self.device, text_encoder_attn
+            )
+        else:
+            self.tokenizer, self.text_encoder = get_tokenizer_and_text_encoder(
+                config.text_encoder.text_encoder_name,
+                device=self.device,
+            )
 
         print("[load] Text encoder loaded. Building DiT model...", flush=True)
         latent_size = config.model.image_size // config.vae.vae_downsample_rate
@@ -539,7 +570,17 @@ class StreamSession:
         return self.last_output if self.last_output is not None else PLACEHOLDER_JPEG
 
 
-app = FastAPI(title="SANA-Streaming Video Server")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load at server startup, not at import time, so diagnostic tooling can
+    # import this module (constants, helpers) without touching the GPU.
+    global pipeline
+    print(f"Loading SANA-Streaming pipeline on {device}...", flush=True)
+    pipeline = SANAStreamingPipeline(device)
+    yield
+
+
+app = FastAPI(title="SANA-Streaming Video Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -550,8 +591,7 @@ app.add_middleware(
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Loading SANA-Streaming pipeline on {device}...")
-pipeline = SANAStreamingPipeline(device)
+pipeline: SANAStreamingPipeline | None = None  # created in lifespan startup
 
 # All GPU work (and all session state) is serialized through this executor.
 gpu_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sana-gpu")

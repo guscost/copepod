@@ -22,6 +22,12 @@ survives power/clock caps is usually a wedged CUDA/Triton kernel, not watts):
         (mis)built for your GPU arch is the culprit; run the server with
         DISABLE_FLASH_ATTN=1 too.
 
+    TEXT_ENCODER_ATTN=eager python diagnose_gpu.py
+        Forces the Gemma text encoder to plain PyTorch eager attention. Try
+        this when the crash happens right after "[load] Weights loaded.
+        Encoding prompt" / Stage 2b — no Triton kernels run that early, so
+        the encoder's attention backend or cuBLAS is the suspect.
+
 Watch power draw in another terminal while it runs:
     watch -n0.5 nvidia-smi --query-gpu=power.draw,temperature.gpu --format=csv
 
@@ -80,7 +86,14 @@ def main():
     from diffusion.model.utils import get_weight_dtype
     from diffusion.utils.config import model_v2v_init_config
     from tools.download import find_model
-    from server import CONFIG_PATH, FRAME_HEIGHT, FRAME_WIDTH, STREAMING_REPO_ID, StreamingInferenceConfig
+    from server import (
+        CONFIG_PATH,
+        FRAME_HEIGHT,
+        FRAME_WIDTH,
+        STREAMING_REPO_ID,
+        StreamingInferenceConfig,
+        load_text_encoder,
+    )
 
     config = pyrallis.parse(config_class=StreamingInferenceConfig, config_path=str(CONFIG_PATH), args=[])
     device = torch.device("cuda")
@@ -96,7 +109,12 @@ def main():
     print(f"  latent shape: {tuple(out.shape)}", flush=True)
 
     stage("Stage 2: load text encoder (gemma-2-2b-it)")
-    tokenizer, text_encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, device=device)
+    te_attn = os.environ.get("TEXT_ENCODER_ATTN")
+    print(f"  text encoder attn_implementation: {te_attn or '(transformers default)'}", flush=True)
+    if te_attn:
+        tokenizer, text_encoder = load_text_encoder(config.text_encoder.text_encoder_name, device, te_attn)
+    else:
+        tokenizer, text_encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, device=device)
     stage("Stage 2b: gemma forward pass (first big compute)")
     tokens = tokenizer("hello world", max_length=300, padding="max_length",
                        truncation=True, return_tensors="pt").to(device)
