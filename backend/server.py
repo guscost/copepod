@@ -96,6 +96,7 @@ class StreamingInferenceConfig:
     vae: AEConfig
     text_encoder: TextEncoderConfig
     scheduler: SchedulerConfig
+    work_dir: str = "output"
 
 
 class IncrementalStreamingSampler(SANAStreamingSampler):
