@@ -80,6 +80,11 @@ class DetectorPipeline:
         # Warm up weights download + CUDA kernels so the first real frame is fast.
         self._detect(np.zeros((512, 512, 3), dtype=np.uint8))
 
+    @property
+    def prompt(self) -> str:
+        """Server interface parity with SanaBackend: the active class list."""
+        return ", ".join(self.classes)
+
     def set_prompt(self, text: str):
         """In detect mode the "prompt" is a comma-separated class list."""
         classes = [c.strip() for c in text.split(",") if c.strip()]

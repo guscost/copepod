@@ -1,8 +1,9 @@
-# Server-only dependencies. The ML stack (torch, diffusers, transformers,
-# accelerate, xformers, flash-linear-attention, ...) is provided by the Sana
-# repo in Sana-main — install it FIRST with Sana's environment_setup.sh or
-# `pip install -e Sana-main`. Do not re-pin torch/diffusers here; the versions
-# must match Sana's pyproject.toml.
+# Server dependencies. For BACKEND_MODE=sana, the ML stack (torch, diffusers,
+# transformers, accelerate, flash-linear-attention, ...) is provided by the
+# Sana repo in Sana-main — install it FIRST with Sana's environment_setup.sh
+# or `pip install -e Sana-main`, and do not pin torch/diffusers here (versions
+# must match Sana's pyproject.toml). BACKEND_MODE=detect only needs torch +
+# ultralytics on top of this list, and does not need the Sana repo at all.
 fastapi>=0.115
 uvicorn>=0.30
 websockets>=12

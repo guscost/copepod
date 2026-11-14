@@ -149,6 +149,9 @@
         canvas.width = 512;
         canvas.height = 512;
 
+        // Backend address: override with ?server=host:port in the URL.
+        const SERVER = new URLSearchParams(location.search).get('server') || 'localhost:8000';
+
         let ws = null;
         let isProcessing = false;
         let streamActive = false;
@@ -170,7 +173,7 @@
                 video.srcObject = stream;
                 
                 // Connect WebSocket
-                ws = new WebSocket('ws://localhost:8000/ws/stream');
+                ws = new WebSocket(`ws://${SERVER}/ws/stream`);
                 
                 ws.onopen = () => {
                     updateStatus('Connected to server');
@@ -264,7 +267,7 @@
         async function applyPrompt() {
             const prompt = promptInput.value;
             try {
-                const response = await fetch('http://localhost:8000/api/prompt', {
+                const response = await fetch(`http://${SERVER}/api/prompt`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt })
@@ -297,6 +300,21 @@
             const btn = document.getElementById('fullscreenBtn');
             btn.textContent = document.fullscreenElement ? '⛶ Exit Fullscreen' : '⛶ Fullscreen';
         });
+
+        // Sync the UI with the backend: reflect the active mode and prefill
+        // the input with the server-side prompt/classes. In "detect" mode the
+        // input is a comma-separated YOLO-World class list, not a prompt.
+        fetch(`http://${SERVER}/api/health`).then(r => r.json()).then(h => {
+            if (h.mode === 'detect') {
+                document.querySelector('h1').textContent = 'Logo/Ad Blanking (YOLO Detector)';
+                document.title = 'Logo/Ad Blanking';
+                promptInput.placeholder = 'Comma-separated detection classes, e.g. "logo, advertising banner"';
+                document.getElementById('applyPromptBtn').textContent = 'Apply Classes';
+            }
+            return fetch(`http://${SERVER}/api/prompt`);
+        }).then(r => r.json()).then(p => {
+            promptInput.value = p.prompt;
+        }).catch(() => { /* server unreachable — leave the HTML defaults */ });
     </script>
 </body>
 </html>
