@@ -153,6 +153,8 @@
         let isProcessing = false;
         let streamActive = false;
         let frameCount = 0;
+        let sentCount = 0;
+        let gotFirstResponse = false;
         let lastFpsUpdate = Date.now();
 
         function updateStatus(msg) {
@@ -182,6 +184,7 @@
                     img.src = URL.createObjectURL(blob);
                     
                     img.onload = () => {
+                        gotFirstResponse = true;
                         ctx.clearRect(0, 0, 512, 512);
                         ctx.drawImage(img, 0, 0, 512, 512);
                         URL.revokeObjectURL(img.src);
@@ -196,6 +199,13 @@
                             frameCount = 0;
                             lastFpsUpdate = now;
                         }
+                    };
+                    img.onerror = () => {
+                        // Without this, one undecodable frame leaves
+                        // isProcessing stuck true and the stream stalls.
+                        console.error('Failed to decode output frame');
+                        URL.revokeObjectURL(img.src);
+                        isProcessing = false;
                     };
                 };
                 
@@ -230,7 +240,7 @@
         function streamLoop() {
             if (!streamActive) return;
             
-            if (video.readyState === video.HAVE_CURRENT_DATA && 
+            if (video.readyState >= video.HAVE_CURRENT_DATA && 
                 ws && ws.readyState === WebSocket.OPEN && 
                 !isProcessing) {
                 
@@ -240,6 +250,10 @@
                     if (blob) {
                         isProcessing = true;
                         ws.send(blob);
+                        sentCount++;
+                        if (!gotFirstResponse) {
+                            updateStatus(`Connected | sent ${sentCount} frames, waiting for first output...`);
+                        }
                     }
                 }, 'image/jpeg', 0.7);
             }

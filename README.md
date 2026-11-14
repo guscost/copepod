@@ -58,6 +58,69 @@ card's power limit, e.g. `nvidia-smi -pl 400` — often sufficient on its own.
 To confirm which stage over-stresses the machine, run
 `python diagnose_gpu.py` and watch `nvidia-smi` power draw in parallel.
 
+### If it still crashes with power/clock limits applied
+
+A whole-machine crash that persists even with `nvidia-smi -pl` and locked
+clocks is usually **not** power delivery — it's a wedged CUDA/Triton kernel
+hanging the GPU (a known failure mode on new architectures like the RTX
+5090's Blackwell/sm_120). Run the diagnostic with synchronous kernel launches
+so the last printed stage is the true culprit:
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 python diagnose_gpu.py
+```
+
+Match the crash point to the culprit:
+
+- **Crash right after `[load] Weights loaded. Encoding prompt`**: the Gemma
+  text encoder's first forward pass (Stage 2b in the diagnostic). No Triton
+  kernels are involved at that point — suspects are the attention backend and
+  cuBLAS bf16 GEMMs. Try forcing the encoder's attention implementation:
+
+  ```bash
+  TEXT_ENCODER_ATTN=eager python diagnose_gpu.py   # or: python server.py
+  ```
+
+  (`eager` = plain PyTorch matmul attention; `sdpa` and `flash_attention_2`
+  are the other choices.)
+
+- **Crash in "Stage 5" / on the first processed frame**: first A/B the
+  flash-attn CUDA kernels (used by the DiT softmax attention layers) against
+  PyTorch's SDPA fallback:
+
+  ```bash
+  DISABLE_FLASH_ATTN=1 python diagnose_gpu.py
+  ```
+
+  If the crash disappears, flash-attn was misbuilt for your GPU arch — keep
+  `DISABLE_FLASH_ATTN=1` set when running `server.py` (slightly slower, but
+  stable). If it still dies with flash-attn disabled, the fused GDN Triton
+  kernels are at fault; that path has no PyTorch fallback in this repo, so
+  the next step is a driver/triton/fla version bump or an upstream issue.
+  If you see **"unspecified launch failure"** (cudaError 719): a kernel
+  crashed in flight (GPU-side segfault). First clear the Triton kernel cache
+  — cubins cached under a different GPU arch/driver cause exactly this:
+
+  ```bash
+  rm -rf ~/.triton/cache
+  CUDA_LAUNCH_BLOCKING=1 TEXT_ENCODER_ATTN=eager DISABLE_FLASH_ATTN=1 python diagnose_gpu.py dit
+  ```
+
+  (`dit` mode skips everything except the Stage 5 DiT forward, for fast
+  iteration.) If it still faults, `compute-sanitizer --tool memcheck python
+  diagnose_gpu.py dit` will name the faulting kernel, and `TRITON_ALWAYS_COMPILE=1`
+  forces recompilation at build time instead of launch.
+
+Also check the kernel log from the crashed boot for the smoking gun:
+
+```bash
+journalctl -k -b -1 | grep -i xid
+```
+
+Xid 13/31 = a kernel faulted (software, fixable as above). Xid 74 ("GPU has
+fallen off the bus") = hardware despite the caps — reseat the 12V-2x6
+connector, avoid splitter cables, check the riser/slot.
+
 ### Frontend
 Open `frontend/index.html` in a browser, or serve it:
 ```bash
