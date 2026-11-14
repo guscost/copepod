@@ -7,6 +7,10 @@ last line on screen/journal tells you exactly which stage triggers the crash.
 Usage:
     python diagnose_gpu.py            # all stages
     python diagnose_gpu.py stress     # pure torch compute stress only
+    python diagnose_gpu.py dit        # skip stress/VAE/text-encoder compute;
+                                      # go straight to the Stage 5 DiT forward
+                                      # (fast iteration when hunting the GDN
+                                      # triton kernel crash)
 
 Useful A/B runs when hunting a kernel-level hang (a whole-machine crash that
 survives power/clock caps is usually a wedged CUDA/Triton kernel, not watts):
@@ -35,6 +39,13 @@ After any crash, check the kernel log from the previous boot:
     journalctl -k -b -1 | grep -i xid
 Xid 13/31 = a kernel faulted (software); Xid 74 "GPU has fallen off the bus"
 = hardware (connector/riser/PSU) despite power limits.
+
+"Unspecified launch failure" (cudaError 719) means a kernel crashed in flight
+(GPU-side segfault). Before anything else, clear the Triton kernel cache —
+cubins cached under a different GPU arch/driver cause exactly this:
+    rm -rf ~/.triton/cache
+If it still faults, run under compute-sanitizer to name the faulting kernel:
+    compute-sanitizer --tool memcheck python diagnose_gpu.py dit
 """
 
 import os
@@ -77,7 +88,8 @@ def main():
           f"device: {torch.cuda.get_device_name(0)} "
           f"(capability {torch.cuda.get_device_capability(0)})", flush=True)
 
-    stress_test()
+    if only != "dit":
+        stress_test()
     if only == "stress":
         return
 
@@ -102,25 +114,34 @@ def main():
 
     stage("Stage 1: load VAE (Lightricks/LTX-2)")
     vae = get_vae(config.vae.vae_type, config.vae.vae_pretrained, device=device, dtype=vae_dtype, config=config.vae)
-    stage(f"Stage 1b: VAE encode one {FRAME_WIDTH}x{FRAME_HEIGHT} frame")
-    from torchvision import transforms as T
-    img = torch.rand(1, 3, 1, FRAME_HEIGHT, FRAME_WIDTH, device=device, dtype=vae_dtype) * 2 - 1
-    out = vae.streaming_causal_encode(img, causal=True, reset_cache=True).latent_dist.mode()
-    print(f"  latent shape: {tuple(out.shape)}", flush=True)
+    if only != "dit":
+        stage(f"Stage 1b: VAE encode one {FRAME_WIDTH}x{FRAME_HEIGHT} frame")
+        from torchvision import transforms as T
+        img = torch.rand(1, 3, 1, FRAME_HEIGHT, FRAME_WIDTH, device=device, dtype=vae_dtype) * 2 - 1
+        out = vae.streaming_causal_encode(img, causal=True, reset_cache=True).latent_dist.mode()
+        print(f"  latent shape: {tuple(out.shape)}", flush=True)
 
-    stage("Stage 2: load text encoder (gemma-2-2b-it)")
-    te_attn = os.environ.get("TEXT_ENCODER_ATTN")
-    print(f"  text encoder attn_implementation: {te_attn or '(transformers default)'}", flush=True)
-    if te_attn:
-        tokenizer, text_encoder = load_text_encoder(config.text_encoder.text_encoder_name, device, te_attn)
+    embed_dim = None
+    if only == "dit":
+        # Skip the text encoder entirely in dit-only mode; Stage 5 feeds the
+        # model random conditioning anyway.
+        embed_dim = getattr(config.text_encoder, "caption_channels", None) or 2304
+        print(f"  (dit mode) using random cond embeds with dim {embed_dim}", flush=True)
     else:
-        tokenizer, text_encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, device=device)
-    stage("Stage 2b: gemma forward pass (first big compute)")
-    tokens = tokenizer("hello world", max_length=300, padding="max_length",
-                       truncation=True, return_tensors="pt").to(device)
-    with torch.no_grad():
-        h = text_encoder(tokens.input_ids, tokens.attention_mask)[0]
-    print(f"  embeds shape: {tuple(h.shape)}", flush=True)
+        stage("Stage 2: load text encoder (gemma-2-2b-it)")
+        te_attn = os.environ.get("TEXT_ENCODER_ATTN")
+        print(f"  text encoder attn_implementation: {te_attn or '(transformers default)'}", flush=True)
+        if te_attn:
+            tokenizer, text_encoder = load_text_encoder(config.text_encoder.text_encoder_name, device, te_attn)
+        else:
+            tokenizer, text_encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, device=device)
+        stage("Stage 2b: gemma forward pass (first big compute)")
+        tokens = tokenizer("hello world", max_length=300, padding="max_length",
+                           truncation=True, return_tensors="pt").to(device)
+        with torch.no_grad():
+            h = text_encoder(tokens.input_ids, tokens.attention_mask)[0]
+        embed_dim = h.shape[-1]
+        print(f"  embeds shape: {tuple(h.shape)}", flush=True)
 
     stage("Stage 3: build DiT (registers GDN/triton modules)")
     latent_size = config.model.image_size // config.vae.vae_downsample_rate
@@ -149,7 +170,7 @@ def main():
     print(f"  attention backend: flash_attn={is_flash_attn_available()} "
           f"xformers={is_xformers_available()} "
           f"chunkwise_gdn={os.environ.get('USE_CHUNKWISE_GDN', '1')}", flush=True)
-    cond = torch.randn(1, 300, h.shape[-1], device=device, dtype=weight_dtype)
+    cond = torch.randn(1, 300, embed_dim, device=device, dtype=weight_dtype)
     # The model raises "Attention type is not available" when mask=None and
     # xformers is disabled; the server always passes the prompt mask (B, L).
     mask = torch.ones(1, 300, device=device, dtype=torch.long)
