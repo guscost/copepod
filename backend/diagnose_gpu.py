@@ -11,6 +11,11 @@ Usage:
                                       # go straight to the Stage 5 DiT forward
                                       # (fast iteration when hunting the GDN
                                       # triton kernel crash)
+    DIT_ITERS=20 python diagnose_gpu.py dit
+                                      # loop the DiT chunk forward, carrying
+                                      # the KV cache like the real stream —
+                                      # reproduces faults that only appear
+                                      # after a few chunks
 
 Useful A/B runs when hunting a kernel-level hang (a whole-machine crash that
 survives power/clock caps is usually a wedged CUDA/Triton kernel, not watts):
@@ -165,7 +170,8 @@ def main():
     del state_dict
     torch.cuda.empty_cache()
 
-    stage("Stage 5: one DiT forward (triton GDN kernels compile + run here)")
+    iters = int(os.environ.get("DIT_ITERS", "1"))
+    stage(f"Stage 5: DiT forward x{iters} (triton GDN kernels compile + run here)")
     from diffusion.utils.import_utils import is_flash_attn_available, is_xformers_available
     print(f"  attention backend: flash_attn={is_flash_attn_available()} "
           f"xformers={is_xformers_available()} "
@@ -174,15 +180,19 @@ def main():
     # The model raises "Attention type is not available" when mask=None and
     # xformers is disabled; the server always passes the prompt mask (B, L).
     mask = torch.ones(1, 300, device=device, dtype=torch.long)
-    noise = torch.randn(1, config.vae.vae_latent_dim, 4, FRAME_HEIGHT // 32, FRAME_WIDTH // 32,
-                        device=device, dtype=weight_dtype)
-    src = torch.randn_like(noise).to(vae_dtype)
     t = torch.tensor([500], device=device)
-    with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
-        out, _ = model(noise, t, cond, start_f=0, end_f=4, frame_index=None,
-                       save_kv_cache=True, kv_cache=[[None] * 6 for _ in model.blocks],
-                       mask=mask, data_info={"image_vae_embeds": src})
-    print(f"  output shape: {tuple(out.shape)}", flush=True)
+    # Repeated chunk forwards with the KV cache carried over, mimicking the
+    # streaming loop (DIT_ITERS=20 reproduces failures that need a few chunks).
+    kv_cache = [[None] * 6 for _ in model.blocks]
+    for i in range(iters):
+        noise = torch.randn(1, config.vae.vae_latent_dim, 4, FRAME_HEIGHT // 32, FRAME_WIDTH // 32,
+                            device=device, dtype=weight_dtype)
+        src = torch.randn_like(noise).to(vae_dtype)
+        with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
+            out, kv_cache = model(noise, t, cond, start_f=4 * i, end_f=4 * (i + 1), frame_index=None,
+                                  save_kv_cache=True, kv_cache=kv_cache,
+                                  mask=mask, data_info={"image_vae_embeds": src})
+        print(f"  iter {i} ok, output shape {tuple(out.shape)}", flush=True)
 
     stage("ALL STAGES PASSED")
 

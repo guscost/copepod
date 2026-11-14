@@ -117,9 +117,28 @@ Also check the kernel log from the crashed boot for the smoking gun:
 journalctl -k -b -1 | grep -i xid
 ```
 
-Xid 13/31 = a kernel faulted (software, fixable as above). Xid 74 ("GPU has
-fallen off the bus") = hardware despite the caps — reseat the 12V-2x6
-connector, avoid splitter cables, check the riser/slot.
+Xid 13/31 = a kernel faulted (software, fixable as above). Xid 79 = "GPU has
+fallen off the bus" — a **hardware/link** event, not a software bug: the card
+momentarily vanished from PCIe. On an eGPU (USB4/Thunderbolt) this means link
+or power delivery, and CUDA errors like "unspecified launch failure" are just
+the aftermath. Confirmed triggers/fixes, in order of likelihood:
+
+1. **Enclosure PSU vs transients**: even with `nvidia-smi -pl`, the 5090's
+   microsecond power spikes can dip the rail and drop the card. Lower the cap
+   further (`-pl 300`) and lock clocks (`-lgc 1200`) to find the stable
+   envelope; the `FRAME_WIDTH`/`FRAME_HEIGHT`/`DENOISE_STEPS`/`FRAME_SKIP`
+   knobs above reduce burst current too.
+2. **12V-2x6 connector**: reseat until it clicks; no pigtails/splitters.
+3. **Cable**: short (≤0.5m) certified 40Gbps TB4/USB4 cable, direct to the
+   port — no hubs or daisy chains.
+4. **PCIe ASPM**: link power management is a classic eGPU dropper — boot
+   with the `pcie_aspm=off` kernel parameter.
+5. **Link health**: watch for correctable PCIe errors while streaming —
+   `journalctl -k -f | grep -i aer`. A stream of AER errors before the drop
+   means a marginal link (cable/port/thermal on the enclosure's TB
+   controller).
+
+Xid 74 = NVLink error (not applicable to PCIe cards).
 
 ### Frontend
 Open `frontend/index.html` in a browser, or serve it:
