@@ -9,3 +9,6 @@ websockets>=12
 Pillow>=10.4
 pyrallis
 termcolor
+# Only needed for BACKEND_MODE=detect (YOLO logo/ad detection + blanking;
+# pulls in opencv-python). The YOLO-World weights auto-download on first run.
+ultralytics>=8.3

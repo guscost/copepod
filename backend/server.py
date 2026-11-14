@@ -100,6 +100,12 @@ JPEG_QUALITY = 80
 # drop the oldest ones (a jump cut) instead of growing latency without bound.
 MAX_PENDING_FRAMES = 48
 
+# Processing backend: "sana" runs the diffusion V2V pipeline (default);
+# "detect" runs the YOLO logo/ad detector + blanking pipeline in
+# detect_pipeline.py — much faster, and only alters detected regions instead
+# of regenerating every frame.
+BACKEND_MODE = os.environ.get("BACKEND_MODE", "sana")
+
 
 @dataclass
 class StreamingInferenceConfig:
@@ -590,9 +596,15 @@ class StreamSession:
 async def lifespan(app: FastAPI):
     # Load at server startup, not at import time, so diagnostic tooling can
     # import this module (constants, helpers) without touching the GPU.
-    global pipeline
-    print(f"Loading SANA-Streaming pipeline on {device}...", flush=True)
-    pipeline = SANAStreamingPipeline(device)
+    global pipeline, detector
+    if BACKEND_MODE == "detect":
+        from detect_pipeline import DetectorPipeline
+
+        print(f"Loading YOLO detector pipeline on {device}...", flush=True)
+        detector = DetectorPipeline(device)
+    else:
+        print(f"Loading SANA-Streaming pipeline on {device}...", flush=True)
+        pipeline = SANAStreamingPipeline(device)
     yield
 
 
@@ -608,6 +620,7 @@ app.add_middleware(
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 pipeline: SANAStreamingPipeline | None = None  # created in lifespan startup
+detector = None  # detect_pipeline.DetectorPipeline when BACKEND_MODE=detect
 
 # All GPU work (and all session state) is serialized through this executor.
 gpu_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sana-gpu")
@@ -632,6 +645,8 @@ def _ingest_frame(data: bytes) -> bytes:
     Runs exclusively on the GPU worker thread.
     """
     global session
+    if BACKEND_MODE == "detect":
+        return detector.process_frame(data)
     if session is None:
         session = StreamSession(pipeline)
         warmup = 1 + session.latents_per_chunk * session.frames_per_latent
@@ -660,9 +675,14 @@ def _ingest_frame(data: bytes) -> bytes:
 def _reset_session():
     global session
     session = None  # drops the DiT KV cache; VAE caches reset on next use
+    if detector is not None:
+        detector.reset()  # fresh ByteTrack state for the next producer
 
 
 def _apply_prompt(prompt: str):
+    if BACKEND_MODE == "detect":
+        detector.set_prompt(prompt)  # comma-separated detection classes
+        return
     pipeline.set_prompt(prompt)
     if session is not None:
         session.sampler.condition = pipeline.prompt_embeds
@@ -732,7 +752,9 @@ async def set_prompt(update: PromptUpdate):
 
 @app.get("/api/prompt")
 async def get_prompt():
-    """Get the current processing prompt."""
+    """Get the current processing prompt (detection classes in detect mode)."""
+    if BACKEND_MODE == "detect":
+        return {"prompt": ", ".join(detector.classes)}
     return {"prompt": pipeline.prompt}
 
 
@@ -748,6 +770,7 @@ async def reset_state():
 async def health():
     return {
         "status": "ok",
+        "mode": BACKEND_MODE,
         "device": str(device),
         "clients": len(connected_clients),
         "streaming": producer is not None,

@@ -1,11 +1,22 @@
 # Copepod
 
-Real-time video-to-video style transformation using SANA-Streaming with FastAPI WebSockets.
+Real-time video-to-video processing over FastAPI WebSockets, with two
+selectable backends (`BACKEND_MODE` env var):
+
+- **`sana`** (default): SANA-Streaming diffusion V2V — regenerates every
+  frame from a text prompt.
+- **`detect`**: YOLO logo/ad detection + blanking — detects logos and
+  advertising, tracks the boxes across frames, and composites a fill (black
+  square by default) over just those regions. Untouched pixels pass through
+  unmodified. This is the right tool when the goal is "find logos/ads and
+  blank them": it runs at full webcam framerate with millisecond latency,
+  which full-frame diffusion cannot sustain.
 
 ## Architecture
 
 ```
 [Client Webcam] → [Canvas Capture] → [WebSocket] → [SANA-Streaming Pipeline] → [Processed Output]
+                                                 ↘ [YOLO detect + blank] ↗   (BACKEND_MODE=detect)
 ```
 
 ## Setup
@@ -33,6 +44,37 @@ python server.py
 Note: install Sana's dependencies *before* `requirements.txt`, and don't pin
 torch/diffusers/transformers yourself — versions must match
 `Sana-main/pyproject.toml`.
+
+### Detector backend (logo/ad blanking)
+
+```bash
+BACKEND_MODE=detect python server.py
+```
+
+Uses YOLO-World (zero-shot — detection classes are plain text, no training)
+by default; `yolov8s-worldv2.pt` auto-downloads on first run. Knobs:
+
+```bash
+# Point at a fine-tuned YOLO checkpoint instead (uses its trained classes)
+YOLO_MODEL=/path/to/logos.pt
+
+# Zero-shot classes (YOLO-World only)
+DETECT_CLASSES="corporate logo,advertising banner,sponsor logo"
+
+# Confidence threshold (default 0.15 — zero-shot scores run low)
+DETECT_CONF=0.25
+
+# Fill style for detected regions (default black)
+FILL_MODE=blur     # black | white | blur | debug (debug draws boxes+labels, no fill)
+
+# Detect every Nth frame, reuse boxes in between (default 1)
+DETECT_EVERY=2
+```
+
+With the YOLO-World model, the "Apply Prompt" box doubles as a class editor:
+enter a comma-separated class list (e.g. `nike logo, adidas logo`) and click
+Apply. Tune classes/confidence with `FILL_MODE=debug` first so you can see
+exactly what the detector is finding.
 
 ### Reducing GPU load / power draw
 
