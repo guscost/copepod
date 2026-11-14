@@ -21,6 +21,7 @@ import copy
 import io
 import os
 import sys
+import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -547,6 +548,14 @@ class StreamSession:
             rest = self.source_latents[:, :, needed:]
             self.source_latents = rest if rest.shape[2] > 0 else None
 
+            if not self.stream_started:
+                print(
+                    "[stream] denoising first chunk (Triton kernels compile here; "
+                    "can take several minutes on a cold cache)...",
+                    flush=True,
+                )
+                t0 = time.time()
+
             noise = torch.randn(
                 1,
                 p.config.vae.vae_latent_dim,
@@ -558,6 +567,13 @@ class StreamSession:
             )
             denoised = self.sampler.sample_chunk(noise, chunk, steps=DENOISE_STEPS)
             pixels = self.decoder.decode_chunk(denoised.to(p.vae_dtype))
+            if not self.stream_started:
+                print(
+                    f"[stream] first chunk denoised+decoded in {time.time() - t0:.1f}s; "
+                    f"pixel min/max/mean: {pixels.min().item():.2f}/"
+                    f"{pixels.max().item():.2f}/{pixels.mean().item():.2f}",
+                    flush=True,
+                )
             self.output_queue.extend(p.pixels_to_jpegs(pixels))
             self.stream_started = True
 
@@ -618,7 +634,19 @@ def _ingest_frame(data: bytes) -> bytes:
     global session
     if session is None:
         session = StreamSession(pipeline)
+        warmup = 1 + session.latents_per_chunk * session.frames_per_latent
+        print(
+            f"[stream] new session; first real output after ~{warmup} input frames",
+            flush=True,
+        )
     session.frames_seen += 1
+    if session.frames_seen % 30 == 0:
+        print(
+            f"[stream] frames received: {session.frames_seen}, "
+            f"buffered: {len(session.frame_buffer)}, "
+            f"outputs pending: {len(session.output_queue)}",
+            flush=True,
+        )
     if (session.frames_seen - 1) % FRAME_SKIP == 0:
         frame = pipeline.preprocess_frame(Image.open(io.BytesIO(data)))
         session.frame_buffer.append(frame)
