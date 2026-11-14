@@ -15,6 +15,8 @@ Architecture notes:
 """
 
 import copy
+import functools
+import importlib.util
 import io
 import os
 import sys
@@ -24,7 +26,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # SANA-Streaming environment setup (must run before importing torch/diffusion).
-os.environ["DISABLE_XFORMERS"] = "1"
+# xFormers ships with the Sana environment and stays enabled: flash-attn takes
+# precedence in the V2V softmax attention, and xFormers drives the V2V
+# cross-attention packing path. Set DISABLE_XFORMERS=1 to force it off.
+os.environ.setdefault("DISABLE_XFORMERS", "0")
 os.environ.setdefault("USE_CHUNKWISE_GDN", "1")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -45,7 +50,7 @@ try:
     from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
-    from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae
+    from diffusion.model.builder import build_model, get_vae
     from diffusion.model.ltx2.streaming_decoder import CausalVaeStreamingDecoder
     from diffusion.model.utils import get_weight_dtype
     from diffusion.scheduler.sana_streaming_sampler import SANAStreamingSampler
@@ -91,6 +96,68 @@ JPEG_QUALITY = 80
 # drop the oldest ones (a jump cut) instead of growing latency without bound.
 MAX_PENDING_FRAMES = 48
 
+# Experimental Torch-TensorRT compilation of hot components. Off by default;
+# enable with a comma-separated list, e.g. TENSORRT=vae,text_encoder (or
+# TENSORRT=all). Requires a torch-tensorrt build matching the installed
+# torch/CUDA. The DiT is deliberately not compilable this way: its stateful
+# KV cache and Triton GDN kernels don't survive graph capture. A component
+# whose compiled call ever fails stays on eager for the rest of the session.
+TENSORRT_COMPONENTS = {c.strip() for c in os.environ.get("TENSORRT", "").split(",") if c.strip()}
+if TENSORRT_COMPONENTS - {"vae", "text_encoder", "all"}:
+    raise SystemExit(
+        f"Unknown TENSORRT component(s): {sorted(TENSORRT_COMPONENTS - {'vae', 'text_encoder', 'all'})} "
+        "(expected a comma-separated subset of: vae, text_encoder, all)"
+    )
+
+_trt_logged: set[str] = set()
+
+
+def _trt_compile(fn, component: str, label: str):
+    """Wrap ``fn`` in torch.compile(backend="tensorrt") when its component is enabled.
+
+    Compilation is lazy (it happens on the first call), so the wrapper catches
+    a failure from any compiled call and permanently falls back to the eager
+    function — a bad graph can never kill the stream.
+    """
+    if not (TENSORRT_COMPONENTS & {component, "all"}):
+        return fn
+    try:
+        trt_installed = importlib.util.find_spec("torch_tensorrt") is not None
+    except ValueError:  # present in sys.modules without a spec — treat as installed
+        trt_installed = True
+    if not trt_installed:
+        if component not in _trt_logged:
+            _trt_logged.add(component)
+            print(
+                f"[tensorrt] {component}: torch-tensorrt not installed; staying eager "
+                "(install a torch-tensorrt build matching your torch/CUDA to enable)",
+                flush=True,
+            )
+        return fn
+    compiled = torch.compile(fn, backend="tensorrt", dynamic=False)
+    failed = False
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal failed
+        if failed:
+            return fn(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as e:
+            failed = True
+            print(
+                f"[tensorrt] {label} failed under TensorRT ({e}); "
+                "eager for the rest of the session",
+                flush=True,
+            )
+            return fn(*args, **kwargs)
+
+    if component not in _trt_logged:
+        _trt_logged.add(component)
+        print(f"[tensorrt] {component}: Torch-TensorRT enabled (compiles on first call)", flush=True)
+    return wrapper
+
 
 @dataclass
 class StreamingInferenceConfig:
@@ -105,9 +172,9 @@ def load_text_encoder(name: str, device, attn_implementation: str):
     """Gemma text encoder load with an explicit attention backend.
 
     Mirrors the gemma branch of Sana's ``get_tokenizer_and_text_encoder`` but
-    passes ``attn_implementation`` through, so a crashing default backend
-    (e.g. SDPA/flash-attn on a brand-new GPU arch) can be swapped for
-    ``eager`` via the TEXT_ENCODER_ATTN env var.
+    passes ``attn_implementation`` through, so the attention backend can be
+    chosen (``flash_attention_2`` by default; ``eager``/``sdpa``/``
+    flash_attention_2`` via the TEXT_ENCODER_ATTN env var).
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -313,19 +380,42 @@ class SANAStreamingPipeline:
             dtype=self.vae_dtype,
             config=config.vae,
         )
+        self.vae.streaming_causal_encode = _trt_compile(
+            self.vae.streaming_causal_encode, "vae", "vae-encode"
+        )
+
+        from diffusion.utils.import_utils import is_flash_attn_available, is_xformers_available
 
         print("[load] VAE loaded. Loading text encoder (gemma-2-2b-it)...", flush=True)
-        text_encoder_attn = os.environ.get("TEXT_ENCODER_ATTN")  # eager|sdpa|flash_attention_2
-        if text_encoder_attn:
+        # FlashAttention is the default text-encoder backend when the kernel
+        # is installed (falling back to SDPA if unavailable or broken, e.g. on
+        # a brand-new GPU arch). Override with TEXT_ENCODER_ATTN=eager|sdpa|
+        # flash_attention_2; an explicit choice is used as-is, no fallback.
+        text_encoder_attn = os.environ.get("TEXT_ENCODER_ATTN")
+        if text_encoder_attn is None:
+            text_encoder_attn = "flash_attention_2" if is_flash_attn_available() else "sdpa"
+            print(
+                f"[load] Text encoder attn_implementation={text_encoder_attn} "
+                "(default; TEXT_ENCODER_ATTN overrides)",
+                flush=True,
+            )
+            try:
+                self.tokenizer, self.text_encoder = load_text_encoder(
+                    config.text_encoder.text_encoder_name, self.device, text_encoder_attn
+                )
+            except Exception as e:
+                if text_encoder_attn == "sdpa":
+                    raise
+                print(f"[load] {text_encoder_attn} failed ({e}); retrying with sdpa", flush=True)
+                self.tokenizer, self.text_encoder = load_text_encoder(
+                    config.text_encoder.text_encoder_name, self.device, "sdpa"
+                )
+        else:
             print(f"[load] Text encoder attn_implementation={text_encoder_attn}", flush=True)
             self.tokenizer, self.text_encoder = load_text_encoder(
                 config.text_encoder.text_encoder_name, self.device, text_encoder_attn
             )
-        else:
-            self.tokenizer, self.text_encoder = get_tokenizer_and_text_encoder(
-                config.text_encoder.text_encoder_name,
-                device=self.device,
-            )
+        self.text_encoder = _trt_compile(self.text_encoder, "text_encoder", "text-encoder")
 
         print("[load] Text encoder loaded. Building DiT model...", flush=True)
         latent_size = config.model.image_size // config.vae.vae_downsample_rate
@@ -336,10 +426,10 @@ class SANAStreamingPipeline:
             **model_kwargs,
         ).to(self.device)
 
-        from diffusion.utils.import_utils import is_flash_attn_available
-
+        xformers_on = is_xformers_available() and os.environ.get("DISABLE_XFORMERS", "0") != "1"
         print(
             f"[load] DiT built (flash_attn={is_flash_attn_available()}, "
+            f"xformers={xformers_on}, "
             f"chunkwise_gdn={os.environ.get('USE_CHUNKWISE_GDN', '1')}). "
             "Downloading/loading checkpoint...",
             flush=True,
@@ -454,6 +544,7 @@ class VaeStreamingDecoder:
             self._causal_decoder = CausalVaeStreamingDecoder(vae)
         else:
             self._causal_decoder = None
+        self.decode_chunk = _trt_compile(self.decode_chunk, "vae", "vae-decode")
 
     @torch.no_grad()
     def decode_chunk(self, z: torch.Tensor) -> torch.Tensor:

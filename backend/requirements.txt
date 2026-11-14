@@ -13,3 +13,12 @@ termcolor
 # Only needed for BACKEND_MODE=detect (YOLO logo/ad detection + blanking;
 # pulls in opencv-python). The YOLO-World weights auto-download on first run.
 ultralytics>=8.3
+
+# Optional accelerators for BACKEND_MODE=sana — do NOT install from here
+# blindly; versions must match the torch/CUDA stack from Sana's
+# environment_setup.sh (which already installs xformers + flash-attn):
+#   xformers==0.0.36           # memory-efficient attention (on by default; DISABLE_XFORMERS=1 opts out)
+#   flash-attn>=2.7.0          # FlashAttention (default for DiT + text encoder when installed)
+# Experimental TensorRT path (TENSORRT=vae,text_encoder): install the
+# torch-tensorrt build matching this torch/CUDA stack, e.g.
+#   pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu128

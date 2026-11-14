@@ -134,7 +134,30 @@ Uses the SANA-Streaming 2B model from [Efficient-Large-Model/SANA-Streaming](htt
 
 ## Production Optimizations
 
-- Use TensorRT compilation for faster inference
-- Enable xFormers/FlashAttention for memory efficiency
-- Consider model quantization for lower VRAM usage
-- Use persistent model loading to avoid reload overhead
+Status of the usual inference optimizations in this stack:
+
+- **FlashAttention** (default): the DiT softmax attention prefers flash-attn
+  when installed, and the Gemma text encoder defaults to
+  `flash_attention_2` (falls back to SDPA if the kernel is unavailable or
+  fails to load). Override the text-encoder backend with
+  `TEXT_ENCODER_ATTN=eager|sdpa|flash_attention_2`; force the DiT off flash
+  with `DISABLE_FLASH_ATTN=1`. Note the DiT's flash path runs in bf16, so it
+  bypasses the config's `fp32_attention: true` (which only applies to the
+  GDN/SDPA paths).
+- **xFormers** (default): installed by Sana's `environment_setup.sh`; drives
+  the V2V cross-attention packing path and is the fallback when flash-attn
+  is absent. Force off with `DISABLE_XFORMERS=1` (the previous behavior).
+- **TensorRT** (experimental, opt-in): `TENSORRT=vae,text_encoder` (or
+  `TENSORRT=all`) compiles those components with Torch-TensorRT on first
+  use, with automatic permanent fallback to eager if a compiled call fails.
+  Requires a torch-tensorrt build matching the installed torch/CUDA (see
+  `backend/requirements.txt`). The DiT is not compilable this way — its
+  stateful KV cache and Triton GDN kernels don't survive graph capture.
+- **Quantization**: bf16 mixed precision (`mixed_precision: bf16` in
+  `sana_streaming_2b_720p.yaml`); no fp8/int8 path for this pipeline.
+- **Persistent model loading** (already in place): the backend loads once in
+  the FastAPI lifespan and is reused across all connections.
+
+Verify what's active from the startup logs: `[load] Text encoder
+attn_implementation=...`, `[load] DiT built (flash_attn=..., xformers=...)`,
+and `[tensorrt] ...` lines.
