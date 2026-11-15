@@ -7,10 +7,11 @@ Backends (BACKEND_MODE env var), each exposing the same interface
 (``process_frame(jpeg_bytes) -> jpeg_bytes``, ``reset()``,
 ``set_prompt(text)``, ``prompt``):
 
-  * "sana" (default): SANA-Streaming diffusion V2V (sana_pipeline.py) —
-    regenerates every frame from a text prompt.
-  * "detect": YOLO logo/ad detection + blanking (detect_pipeline.py) — only
-    alters detected regions; much faster and lower latency.
+  * "detect" (default): YOLO logo/ad detection + blanking
+    (detect_pipeline.py) — only alters detected regions; much faster and
+    lower latency.
+  * "sana": SANA-Streaming diffusion V2V (sana_pipeline.py) — regenerates
+    every frame from a text prompt.
 
 Architecture notes:
   * One "producer" connection sends frames; all connections (including the
@@ -38,7 +39,7 @@ except ModuleNotFoundError as e:
         "Install them with:  pip install -r backend/requirements.txt"
     ) from e
 
-BACKEND_MODE = os.environ.get("BACKEND_MODE", "sana")  # sana|detect
+BACKEND_MODE = os.environ.get("BACKEND_MODE", "detect")  # sana|detect
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 backend = None  # SanaBackend | DetectorPipeline; created in lifespan startup

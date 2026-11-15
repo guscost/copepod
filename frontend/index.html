@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Streaming Video Processor</title>
+    <title>Logo/Ad Blanking</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -109,15 +109,15 @@
 </head>
 <body>
     <div class="container">
-        <h1>SANA-Streaming Video Processor</h1>
+        <h1>Logo/Ad Blanking (YOLO Detector)</h1>
         
         <div class="controls">
             <input type="text" id="prompt" class="prompt-input" 
-                   placeholder="Enter processing prompt"
-                   value="Replace all corporate logos, and all still or video advertising, with black squares">
+                   placeholder='Comma-separated detection classes, e.g. "logo, advertising banner"'
+                   value="logo, advertising banner">
             <button id="startBtn" class="btn btn-primary">Start Stream</button>
             <button id="stopBtn" class="btn btn-secondary">Stop</button>
-            <button id="applyPromptBtn" class="btn btn-secondary">Apply Prompt</button>
+            <button id="applyPromptBtn" class="btn btn-secondary">Apply Classes</button>
             <div id="status" class="status">Ready</div>
         </div>
         
@@ -302,14 +302,15 @@
         });
 
         // Sync the UI with the backend: reflect the active mode and prefill
-        // the input with the server-side prompt/classes. In "detect" mode the
-        // input is a comma-separated YOLO-World class list, not a prompt.
+        // the input with the server-side prompt/classes. In "detect" mode
+        // (the server default) the input is a comma-separated YOLO-World
+        // class list, not a prompt.
         fetch(`http://${SERVER}/api/health`).then(r => r.json()).then(h => {
-            if (h.mode === 'detect') {
-                document.querySelector('h1').textContent = 'Logo/Ad Blanking (YOLO Detector)';
-                document.title = 'Logo/Ad Blanking';
-                promptInput.placeholder = 'Comma-separated detection classes, e.g. "logo, advertising banner"';
-                document.getElementById('applyPromptBtn').textContent = 'Apply Classes';
+            if (h.mode === 'sana') {
+                document.querySelector('h1').textContent = 'SANA-Streaming Video Processor';
+                document.title = 'SANA-Streaming Video Processor';
+                promptInput.placeholder = 'Enter processing prompt';
+                document.getElementById('applyPromptBtn').textContent = 'Apply Prompt';
             }
             return fetch(`http://${SERVER}/api/prompt`);
         }).then(r => r.json()).then(p => {

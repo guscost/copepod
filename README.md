@@ -3,20 +3,20 @@
 Real-time video-to-video processing over FastAPI WebSockets, with two
 selectable backends (`BACKEND_MODE` env var):
 
-- **`sana`** (default): SANA-Streaming diffusion V2V — regenerates every
-  frame from a text prompt.
-- **`detect`**: YOLO logo/ad detection + blanking — detects logos and
+- **`detect`** (default): YOLO logo/ad detection + blanking — detects logos and
   advertising, tracks the boxes across frames, and composites a fill (black
   square by default) over just those regions. Untouched pixels pass through
   unmodified. This is the right tool when the goal is "find logos/ads and
   blank them": it runs at full webcam framerate with millisecond latency,
   which full-frame diffusion cannot sustain.
+- **`sana`**: SANA-Streaming diffusion V2V — regenerates every frame from a
+  text prompt (`BACKEND_MODE=sana`).
 
 ## Architecture
 
 ```
-[Client Webcam] → [Canvas Capture] → [WebSocket] → [SANA-Streaming Pipeline] → [Processed Output]
-                                                 ↘ [YOLO detect + blank] ↗   (BACKEND_MODE=detect)
+[Client Webcam] → [Canvas Capture] → [WebSocket] → [YOLO detect + blank] → [Processed Output]
+                                                 ↘ [SANA-Streaming Pipeline] ↗   (BACKEND_MODE=sana)
 ```
 
 ## Setup
@@ -49,10 +49,10 @@ Code layout: `server.py` is just the websocket/API plumbing; the two backends
 live in `sana_pipeline.py` (diffusion V2V) and `detect_pipeline.py` (YOLO
 blanking), each exposing `process_frame` / `reset` / `set_prompt` / `prompt`.
 
-### Detector backend (logo/ad blanking)
+### Detector backend (logo/ad blanking, default)
 
 ```bash
-BACKEND_MODE=detect python server.py
+python server.py   # or explicitly: BACKEND_MODE=detect python server.py
 ```
 
 Uses YOLO-World (zero-shot — detection classes are plain text, no training)
