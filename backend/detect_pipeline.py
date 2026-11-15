@@ -46,7 +46,7 @@ import numpy as np
 from PIL import Image
 
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8s-worldv2.pt")
-DEFAULT_CLASSES = "corporate logo,brand logo,advertisement,advertising banner,sponsor logo"
+DEFAULT_CLASSES = "logo,brand,corporate logo,brand logo,advertisement,billboard,sponsor,consumer product"
 DETECT_CLASSES = [
     c.strip() for c in os.environ.get("DETECT_CLASSES", DEFAULT_CLASSES).split(",") if c.strip()
 ]
