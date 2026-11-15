@@ -130,7 +130,11 @@ class DetectorPipeline:
         frame = np.array(Image.open(io.BytesIO(data)).convert("RGB"))  # writable copy
         self._frames += 1
 
-        if self._frames % DETECT_EVERY == 1 or not self._detections:
+        # _frames is 1-based, so detect on frames 1, 1+N, 1+2N, ... (with
+        # DETECT_EVERY=1 that is every frame). Also re-detect immediately
+        # whenever no boxes are known, so new ads are boxed without waiting
+        # for the next scheduled detection frame.
+        if (self._frames - 1) % DETECT_EVERY == 0 or not self._detections:
             t0 = time.perf_counter()
             self._detections = self._detect(frame)
             self._detects += 1
