@@ -33,11 +33,17 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   conservatively; raise it if false positives appear). Doubles
                   as Grounding DINO's box threshold.
   GDINO_TEXT_THRESHOLD  Grounding DINO token-to-phrase threshold (0.25).
-  GDINO_FP16      Run Grounding DINO under fp16 autocast on CUDA (default 1;
-                  set 0 to force fp32). Autocast keeps fp32-only ops
-                  (LayerNorm, deformable-attention sampling, contrastive
-                  heads) in fp32 instead of casting the whole model with
-                  .half(), which avoids float/half mismatches.
+  GDINO_FP16      Run Grounding DINO in fp16 on CUDA (default 1; set 0 to
+                  force fp32). Eager runs under fp16 autocast, which keeps
+                  fp32-only ops (LayerNorm, deformable-attention sampling,
+                  contrastive heads) in fp32 instead of casting the whole
+                  model with .half(), avoiding float/half mismatches. With
+                  GDINO_TRT the engine is instead compiled with
+                  enabled_precisions={fp16}: the graph is traced in fp32
+                  (autocast disabled for the compiled call) and the TensorRT
+                  builder picks fp16 kernels itself — feeding it an
+                  autocast-traced graph compiles to an engine that emits
+                  NaN logits.
   GDINO_TRT       Compile Grounding DINO with Torch-TensorRT (default 0;
                   experimental — roughly 2x throughput over eager fp16 once
                   compiled). Requires a torch-tensorrt build matching the
@@ -398,7 +404,16 @@ class DetectorPipeline:
                 functorch_config.generate_fake_kernels_from_real_mismatches = True
         except ImportError:
             pass
-        compiled = torch.compile(model, backend="torch_tensorrt", dynamic=False)
+        # fp16 is done through the TRT builder (enabled_precisions), not by
+        # tracing under autocast: an autocast-traced graph arrives with
+        # explicit fp16 casts and compiles to an engine that emits NaN logits
+        # (scores collapse vs eager). Tracing a clean fp32 graph and letting
+        # the builder pick fp16 kernels keeps fp32 accumulation where it
+        # matters and matches eager fp16 output.
+        options = {"enabled_precisions": {torch.float16}} if GDINO_FP16 else {}
+        compiled = torch.compile(
+            model, backend="torch_tensorrt", dynamic=False, options=options
+        )
 
         def wrapper(*args, **kwargs):
             # `failed` is an attribute (not a closure flag) so the eager/TRT
@@ -409,7 +424,10 @@ class DetectorPipeline:
                 # Compilation happens lazily inside this call. torch_tensorrt's
                 # dynamo backend builds a RuntimeSettings object that only does
                 # anything on TRT-RTX builds and warns about it otherwise.
-                with warnings.catch_warnings():
+                # Autocast is disabled so the traced graph is pure fp32; the
+                # engine's own fp16 precision (enabled_precisions) handles the
+                # speedup. The eager fallback below still runs under autocast.
+                with warnings.catch_warnings(), torch.autocast("cuda", enabled=False):
                     warnings.filterwarnings(
                         "ignore", message="RuntimeSettings is only honored.*"
                     )
