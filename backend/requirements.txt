@@ -11,12 +11,14 @@ Pillow>=10.4
 pyrallis
 termcolor
 # Only needed for BACKEND_MODE=detect (logo/ad detection + blanking).
-# The default detector is Grounding DINO (transformers; weights auto-download
-# from Hugging Face on first run — already present in the Sana environment).
-transformers>=4.45
-# YOLO mode (YOLO_MODEL=yolov8s-worldv2.pt or a fine-tuned checkpoint) needs
-# ultralytics (pulls in opencv-python); YOLO-World weights auto-download.
+# The default detector is a pair of fine-tuned YOLO checkpoints
+# (BILLBOARD_YOLO + BRAND_EYE_YOLO in detect_pipeline.py) — ultralytics plus
+# huggingface_hub to download the weights from Hugging Face on first run.
+huggingface_hub>=0.24
 ultralytics>=8.3
+# Grounding DINO (YOLO_MODEL=IDEA-Research/grounding-dino-*, zero-shot;
+# already present in the Sana environment) needs transformers.
+transformers>=4.45
 # The optional GDINO_TRT=1 TensorRT path uses the same torch-tensorrt build
 # described in the TensorRT note below.
 

@@ -4,10 +4,20 @@ Real-time video-to-video processing over FastAPI WebSockets.
 
 ## Quickstart
 
-For an RTX 5090 install the CUDA toolkit (13.2 is tested), torch, and everything up to `# YOLO mode` in backend/requirements.txt plus `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run:
+For the default ad-blocking YOLO models, install the CUDA toolkit (13.2 is tested), torch, and the normal items in backend/requirements.txt, then in the backend folder run:
 
 ```
-DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.25 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
+python server.py
+```
+
+Open frontend/index.html, and start the webcam stream.
+
+## Grounding DINO for general detection
+
+Add `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run e.g. (for a 5090):
+
+```
+DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.5 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
 ```
 
 ## Modes
@@ -15,12 +25,13 @@ DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.25 GDI
 Exposes two selectable backend patterns (`BACKEND_MODE` env var):
 
 - **`detect`** (default): logo/ad detection + blanking — detects logos and
-  advertising with a zero-shot detector (Grounding DINO by default, or the
-  lighter/faster YOLO-World), tracks the boxes across frames, and composites a
-  fill (black square by default) over just those regions. Untouched pixels
-  pass through unmodified. This is the right tool when the goal is "find
-  logos/ads and blank them": it runs at full webcam framerate with
-  millisecond latency, which full-frame diffusion cannot sustain.
+  advertising with two fine-tuned YOLO checkpoints combined by default (a
+  billboard detector plus a brand-logo detector), tracks the boxes across
+  frames, and composites a fill (black square by default) over just those
+  regions. Untouched pixels pass through unmodified. This is the right tool
+  when the goal is "find logos/ads and blank them": it runs at full webcam
+  framerate with millisecond latency, which full-frame diffusion cannot
+  sustain.
 - **`sana`**: SANA-Streaming diffusion V2V — regenerates every frame from a
   text prompt (`BACKEND_MODE=sana`).
 
@@ -67,26 +78,35 @@ live in `sana_pipeline.py` (diffusion V2V) and `detect_pipeline.py` (detection
 python server.py   # or explicitly: BACKEND_MODE=detect python server.py
 ```
 
-Uses Grounding DINO (zero-shot — detection classes are plain text, no
-training) by default; `IDEA-Research/grounding-dino-base` auto-downloads from
-Hugging Face on first run, and runs at ~30+ fps under fp16 autocast on a
-high-end GPU.
+Runs two fine-tuned YOLO checkpoints together by default —
+[`maco018/billboard-detection-Yolo11`](https://huggingface.co/maco018/billboard-detection-Yolo11)
+(billboards) and
+[`haydarkadioglu/brand-eye`](https://huggingface.co/haydarkadioglu/brand-eye)
+(33 car-brand logos). Both auto-download from Hugging Face on first run, and
+their detections are combined into one track set. Either can be disabled or
+swapped, and a single `YOLO_MODEL` still selects any one detector (zero-shot
+or fine-tuned) as before.
 Detect-only deployments can skip the Sana repo entirely — just
 `pip install torch` plus `requirements.txt`. Knobs:
 
 ```bash
-# Switch detector (any name containing "grounding" → Grounding DINO,
-# "world" → YOLO-World, anything else → fine-tuned YOLO checkpoint)
-YOLO_MODEL=IDEA-Research/grounding-dino-tiny   # smaller/faster Grounding DINO
+# Default pair, individually replaceable (owner/repo[:file] on Hugging Face
+# or a local .pt path) or disabled with "off"
+BILLBOARD_YOLO=maco018/billboard-detection-Yolo11:yolo11m.pt   # n/s/m/l/x variants
+BRAND_EYE_YOLO=off                                             # disable the brand-logo detector
+
+# Single-detector override (any name containing "grounding" → Grounding DINO,
+# "world" → YOLO-World, anything else → one fine-tuned YOLO checkpoint)
+YOLO_MODEL=IDEA-Research/grounding-dino-base   # zero-shot Grounding DINO
 YOLO_MODEL=yolov8s-worldv2.pt                  # lightweight YOLO-World
 YOLO_MODEL=/path/to/logos.pt                   # fine-tuned YOLO (uses its trained classes)
 
 # Zero-shot classes (Grounding DINO / YOLO-World only)
 DETECT_CLASSES="corporate logo,advertising banner,sponsor logo"
 
-# Confidence threshold (default 0.15 — zero-shot scores run low); doubles as
-# Grounding DINO's box threshold
-DETECT_CONF=0.25
+# Confidence threshold (default 0.25; zero-shot scores run low — use ~0.15
+# for Grounding DINO / YOLO-World); doubles as Grounding DINO's box threshold
+DETECT_CONF=0.3
 
 # Fill style for detected regions (default black)
 FILL_MODE=blur     # black | white | blur | debug (debug draws boxes+labels, no fill)
@@ -100,7 +120,7 @@ enter a comma-separated class list (e.g. `nike logo, adidas logo`) and click
 Apply. Tune classes/confidence with `FILL_MODE=debug` first so you can see
 exactly what the detector is finding.
 
-#### Grounding DINO knobs (default detector)
+#### Grounding DINO knobs
 
 Grounding DINO is a zero-shot transformer detector — considerably more
 accurate than YOLO-World on ambiguous classes like "logo": fewer false

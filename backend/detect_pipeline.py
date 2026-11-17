@@ -11,8 +11,8 @@ per-frame latency is a few milliseconds on a modern GPU.
 
 Selected with BACKEND_MODE=detect in server.py. Env knobs:
 
-  YOLO_MODEL      Checkpoint path/name. Three flavors are supported:
-                  * contains "grounding" (default:
+  YOLO_MODEL      Single-detector override. Three flavors are supported:
+                  * contains "grounding" (e.g.
                     IDEA-Research/grounding-dino-base, auto-downloaded from
                     Hugging Face on first run): Grounding DINO via
                     transformers — a heavier zero-shot transformer detector
@@ -27,11 +27,26 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                     lightweight option for weaker GPUs.
                   * anything else: a fine-tuned YOLO checkpoint, using the
                     classes it was trained on.
+                  Unset (default): the two fine-tuned checkpoints below run
+                  together and their detections are combined.
+  BILLBOARD_YOLO  Billboard detector spec (default
+                  maco018/billboard-detection-Yolo11:yolo11s.pt — swap the
+                  filename for the yolo11n/m/l/x variants). Set to "off" to
+                  disable.
+  BRAND_EYE_YOLO  Brand/logo detector spec (default
+                  haydarkadioglu/brand-eye:brandeye.pt). Set to "off" to
+                  disable.
+                  Fine-tuned specs are owner/repo[:file] on Hugging Face
+                  (weights auto-download on first run; the file may be
+                  omitted when the repo contains exactly one .pt) or a local
+                  .pt path. Zero-shot detectors (grounding/world) are
+                  single-model only — select them with YOLO_MODEL.
   DETECT_CLASSES  Comma-separated zero-shot classes (YOLO-World / Grounding
                   DINO only).
-  DETECT_CONF     Confidence threshold (default 0.15 — zero-shot models score
-                  conservatively; raise it if false positives appear). Doubles
-                  as Grounding DINO's box threshold.
+  DETECT_CONF     Confidence threshold (default 0.25; zero-shot models score
+                  conservatively — lower towards 0.15 for those, raise it if
+                  false positives appear). Doubles as Grounding DINO's box
+                  threshold.
   GDINO_TEXT_THRESHOLD  Grounding DINO token-to-phrase threshold (0.25).
   GDINO_FP16      Run Grounding DINO in fp16 on CUDA (default 1; set 0 to
                   force fp32). Eager runs under fp16 autocast, which keeps
@@ -111,12 +126,23 @@ import cv2
 import numpy as np
 from PIL import Image
 
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "IDEA-Research/grounding-dino-base")
+# Single-detector override (Grounding DINO / YOLO-World / one fine-tuned
+# checkpoint). Unset: the BILLBOARD_YOLO + BRAND_EYE_YOLO pair below runs.
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "")
+# Default detector: two fine-tuned YOLO checkpoints combined — billboards
+# plus brand logos. Each spec is owner/repo[:file] on Hugging Face (weights
+# auto-download on first run) or a local .pt path; "off"/"0"/"" disables it.
+BILLBOARD_YOLO = os.environ.get(
+    "BILLBOARD_YOLO", "maco018/billboard-detection-Yolo11:yolo11s.pt"
+)
+BRAND_EYE_YOLO = os.environ.get(
+    "BRAND_EYE_YOLO", "haydarkadioglu/brand-eye:brandeye.pt"
+)
 DEFAULT_CLASSES = "corporate logo,brand logo,advertisement,billboard,sponsor"
 DETECT_CLASSES = [
     c.strip() for c in os.environ.get("DETECT_CLASSES", DEFAULT_CLASSES).split(",") if c.strip()
 ]
-DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.15"))
+DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.25"))
 GDINO_TEXT_THRESHOLD = float(os.environ.get("GDINO_TEXT_THRESHOLD", "0.25"))
 GDINO_FP16 = os.environ.get("GDINO_FP16", "1") != "0"
 GDINO_TRT = os.environ.get("GDINO_TRT", "0") != "0"
@@ -143,6 +169,55 @@ MIN_HITS = max(1, int(os.environ.get("MIN_HITS", "2")))
 TRACK_TTL = max(0, int(os.environ.get("TRACK_TTL", "5")))
 TRACK_SMOOTH = float(os.environ.get("TRACK_SMOOTH", "0.6"))
 JPEG_QUALITY = 80
+# ByteTrack ids are per-model; offset each model's ids by this stride so
+# tracks from different fine-tuned checkpoints can't collide in the shared
+# track state.
+_TRACK_ID_STRIDE = 1_000_000
+
+
+def _yolo_specs() -> list:
+    """Active detector spec list.
+
+    YOLO_MODEL selects a single detector (Grounding DINO, YOLO-World, or one
+    fine-tuned checkpoint), as before. Unset, the default is the billboard +
+    brand-eye fine-tuned pair; each is disabled by setting its knob to
+    "off"/"0"/"".
+    """
+    if YOLO_MODEL:
+        return [YOLO_MODEL]
+    specs = [
+        s
+        for s in (BILLBOARD_YOLO, BRAND_EYE_YOLO)
+        if s.strip().lower() not in ("", "0", "off", "none")
+    ]
+    if not specs:
+        raise SystemExit(
+            "No detector enabled: set YOLO_MODEL, BILLBOARD_YOLO, or BRAND_EYE_YOLO"
+        )
+    return specs
+
+
+def _resolve_yolo_spec(spec: str) -> str:
+    """Resolve a model spec to something ultralytics.YOLO() can load.
+
+    Local paths and plain ultralytics model names (e.g. yolov8s-worldv2.pt,
+    auto-downloaded by ultralytics) pass through; owner/repo[:file] is a
+    Hugging Face hub checkpoint downloaded via huggingface_hub.
+    """
+    if os.path.exists(spec) or "/" not in spec:
+        return spec
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    repo, _, filename = spec.partition(":")
+    if not filename:
+        candidates = [f for f in list_repo_files(repo) if f.endswith(".pt")]
+        if len(candidates) != 1:
+            raise SystemExit(
+                f"{repo} has multiple checkpoints; specify one as "
+                f"'{repo}:<file>' — one of: {', '.join(candidates)}"
+            )
+        filename = candidates[0]
+    return hf_hub_download(repo, filename)
 
 
 class _IoUTracker:
@@ -310,24 +385,42 @@ class DetectorPipeline:
         else:
             self.ul_device = "cpu"
 
-        model_name = os.path.basename(YOLO_MODEL).lower()
+        specs = _yolo_specs()
+        # Zero-shot detectors are only reachable as a single-model override.
+        single = specs[0] if len(specs) == 1 else ""
+        model_name = os.path.basename(single).lower()
         self.is_gdino = "grounding" in model_name
         self.is_world = not self.is_gdino and "world" in model_name
+        if len(specs) > 1 and any(
+            "grounding" in os.path.basename(s).lower() or "world" in os.path.basename(s).lower()
+            for s in specs
+        ):
+            raise SystemExit(
+                "Grounding DINO / YOLO-World are zero-shot single detectors; "
+                "select one with YOLO_MODEL=... instead of the multi-model knobs"
+            )
         self.classes = list(DETECT_CLASSES)
-        print(f"[detect] loading {YOLO_MODEL}...", flush=True)
+        self.models = []  # [(tag, YOLO)] for world/fine-tuned; unused by gdino
         if self.is_gdino:
-            self._init_gdino(device)
+            print(f"[detect] loading {single}...", flush=True)
+            self._init_gdino(device, single)
         elif self.is_world:
             from ultralytics import YOLOWorld
 
-            self.model = YOLOWorld(YOLO_MODEL)
-            self.model.set_classes(self.classes)
+            print(f"[detect] loading {single}...", flush=True)
+            model = YOLOWorld(_resolve_yolo_spec(single))
+            model.set_classes(self.classes)
+            self.models.append(("world", model))
             print(f"[detect] zero-shot classes: {self.classes}", flush=True)
         else:
             from ultralytics import YOLO
 
-            self.model = YOLO(YOLO_MODEL)
-            print(f"[detect] fine-tuned classes: {list(self.model.names.values())}", flush=True)
+            for spec in specs:
+                print(f"[detect] loading {spec}...", flush=True)
+                model = YOLO(_resolve_yolo_spec(spec))
+                tag = os.path.splitext(os.path.basename(spec.partition(":")[2] or spec))[0]
+                self.models.append((tag, model))
+                print(f"[detect] {tag} classes: {list(model.names.values())}", flush=True)
 
         # track_id -> {"box": np.array([x1,y1,x2,y2]), "conf", "label",
         #              "last_seen", "hits"}
@@ -351,7 +444,7 @@ class DetectorPipeline:
         self._detect(np.zeros((warm_h, warm_w, 3), dtype=np.uint8))
         self._shape_logged = False  # ... then log it for the first real frame
 
-    def _init_gdino(self, device):
+    def _init_gdino(self, device, model_id):
         import warnings
 
         import torch
@@ -363,11 +456,11 @@ class DetectorPipeline:
             warnings.filterwarnings(
                 "ignore", message=".*torch.jit.script is deprecated.*", category=FutureWarning
             )
-            self.processor = AutoProcessor.from_pretrained(YOLO_MODEL)
+            self.processor = AutoProcessor.from_pretrained(model_id)
             # Weights stay in fp32; fp16 happens via autocast at inference
             # time so fp32-only ops don't hit float/half mismatches.
             self._gdino_amp = device.type == "cuda" and GDINO_FP16
-            self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(device)
+            self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
         self.gdino.eval()
         if GDINO_TRT and device.type == "cuda":
             _patch_swin_for_trt()
@@ -522,7 +615,7 @@ class DetectorPipeline:
             return
         self.classes = classes
         if self.is_world:
-            self.model.set_classes(classes)
+            self.models[0][1].set_classes(classes)
         self.reset()
         print(f"[detect] classes updated: {classes}", flush=True)
 
@@ -533,31 +626,40 @@ class DetectorPipeline:
         if self.is_gdino:
             self._iou_tracker.reset()
         else:
-            # Drop the predictor so ByteTrack starts from a clean slate.
-            self.model.predictor = None
+            # Drop the predictors so ByteTrack starts from a clean slate.
+            for _, model in self.models:
+                model.predictor = None
 
     def _detect(self, frame: np.ndarray):
         if self.is_gdino:
             return self._detect_gdino(frame)
-        results = self.model.track(
-            frame,
-            persist=True,
-            tracker="bytetrack.yaml",
-            conf=DETECT_CONF,
-            device=self.ul_device,
-            verbose=False,
-        )
-        boxes = results[0].boxes
         detections = []
-        if boxes is not None and len(boxes):
+        multi = len(self.models) > 1
+        for m_idx, (tag, model) in enumerate(self.models):
+            results = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                conf=DETECT_CONF,
+                device=self.ul_device,
+                verbose=False,
+            )
+            boxes = results[0].boxes
+            if boxes is None or not len(boxes):
+                continue
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
             clss = boxes.cls.cpu().numpy().astype(int)
             ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
             names = results[0].names
             for i, ((x1, y1, x2, y2), conf, cls) in enumerate(zip(xyxy, confs, clss)):
-                track_id = int(ids[i]) if ids is not None else None
-                detections.append((track_id, x1, y1, x2, y2, float(conf), names[cls]))
+                # Offset ByteTrack ids per model so tracks from different
+                # checkpoints can't collide in the shared track state.
+                track_id = int(ids[i]) + m_idx * _TRACK_ID_STRIDE if ids is not None else None
+                # With several models, tag the label so FILL_MODE=debug shows
+                # which checkpoint fired.
+                label = f"{tag}:{names[cls]}" if multi else names[cls]
+                detections.append((track_id, x1, y1, x2, y2, float(conf), label))
         return detections
 
     def _detect_gdino(self, frame: np.ndarray):
