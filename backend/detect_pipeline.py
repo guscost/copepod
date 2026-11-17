@@ -41,12 +41,14 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
   GDINO_TRT       Compile Grounding DINO with Torch-TensorRT (default 0;
                   experimental — roughly 2x throughput over eager fp16 once
                   compiled). Requires a torch-tensorrt build matching the
-                  installed torch/CUDA (see requirements.txt). Compilation is
-                  lazy and happens on the warmup frame, so set FRAME_WIDTH /
-                  FRAME_HEIGHT (default 1280x720) to the actual incoming frame
-                  size, otherwise the first real frame pays a recompile. A
-                  call that fails under TensorRT permanently falls back to
-                  eager for the rest of the session.
+                  installed torch/CUDA (see requirements.txt). HF Swin's
+                  window ops are patched (view->reshape) before compiling to
+                  work around a dynamo mis-trace of permuted strides.
+                  Compilation is lazy and happens on the warmup frame, so set
+                  FRAME_WIDTH / FRAME_HEIGHT (default 1280x720) to the actual
+                  incoming frame size, otherwise the first real frame pays a
+                  recompile. A call that fails under TensorRT permanently
+                  falls back to eager for the rest of the session.
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
                   boxes in between (default 1; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
@@ -145,6 +147,43 @@ class _IoUTracker:
         return ids
 
 
+def _patch_swin_for_trt():
+    """Work around a dynamo/Torch-TensorRT mis-trace of HF Swin's window ops.
+
+    window_partition/window_reverse end in ``permute(...).contiguous().view(...)``;
+    under torch.compile the tracer can drop the contiguous() and then fail the
+    view on the still-permuted strides ("Cannot view a tensor with shape ...
+    and strides ..."). Rewriting the final .view as .reshape forces a copy
+    when the strides require one. Numerically identical in eager (a reshape
+    of contiguous data is free), so the patch is safe to leave applied.
+    """
+    import transformers.models.swin.modeling_swin as swin
+
+    def window_partition(input_feature, window_size):
+        batch_size, height, width, num_channels = input_feature.shape
+        input_feature = input_feature.view(
+            batch_size,
+            height // window_size,
+            window_size,
+            width // window_size,
+            window_size,
+            num_channels,
+        )
+        return input_feature.permute(0, 1, 3, 2, 4, 5).reshape(
+            -1, window_size, window_size, num_channels
+        )
+
+    def window_reverse(windows, window_size, height, width):
+        num_channels = windows.shape[-1]
+        windows = windows.view(
+            -1, height // window_size, width // window_size, window_size, window_size, num_channels
+        )
+        return windows.permute(0, 1, 3, 2, 4, 5).reshape(-1, height, width, num_channels)
+
+    swin.window_partition = window_partition
+    swin.window_reverse = window_reverse
+
+
 class DetectorPipeline:
     """Per-frame detector with persistent, temporally-smoothed box state.
 
@@ -211,11 +250,11 @@ class DetectorPipeline:
         self._gdino_amp = device.type == "cuda" and GDINO_FP16
         self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(device)
         self.gdino.eval()
-        self._gdino_forward = (
-            self._trt_wrap(self.gdino)
-            if (GDINO_TRT and device.type == "cuda")
-            else self.gdino
-        )
+        if GDINO_TRT and device.type == "cuda":
+            _patch_swin_for_trt()
+            self._gdino_forward = self._trt_wrap(self.gdino)
+        else:
+            self._gdino_forward = self.gdino
         self._iou_tracker = _IoUTracker()
         mode = "fp16 autocast" if self._gdino_amp else "fp32"
         print(
