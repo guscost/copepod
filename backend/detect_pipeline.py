@@ -112,7 +112,7 @@ import numpy as np
 from PIL import Image
 
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "IDEA-Research/grounding-dino-base")
-DEFAULT_CLASSES = "logo,brand,corporate logo,brand logo,advertisement,billboard,sponsor,consumer product"
+DEFAULT_CLASSES = "corporate logo,brand logo,advertisement,billboard,sponsor"
 DETECT_CLASSES = [
     c.strip() for c in os.environ.get("DETECT_CLASSES", DEFAULT_CLASSES).split(",") if c.strip()
 ]

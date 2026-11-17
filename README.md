@@ -1,7 +1,18 @@
 # Copepod
 
-Real-time video-to-video processing over FastAPI WebSockets, with two
-selectable backends (`BACKEND_MODE` env var):
+Real-time video-to-video processing over FastAPI WebSockets.
+
+## Quickstart
+
+For an RTX 5090 install the CUDA toolkit (13.2 is tested), torch, and everything up to `# YOLO mode` in backend/requirements.txt plus `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run:
+
+```
+DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.25 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
+```
+
+## Modes
+
+Exposes two selectable backend patterns (`BACKEND_MODE` env var):
 
 - **`detect`** (default): logo/ad detection + blanking — detects logos and
   advertising with a zero-shot detector (Grounding DINO by default, or the
