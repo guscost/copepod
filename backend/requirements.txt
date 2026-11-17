@@ -13,6 +13,11 @@ termcolor
 # Only needed for BACKEND_MODE=detect (YOLO logo/ad detection + blanking;
 # pulls in opencv-python). The YOLO-World weights auto-download on first run.
 ultralytics>=8.3
+# Grounding DINO mode (YOLO_MODEL=IDEA-Research/grounding-dino-tiny) also needs:
+#   pip install "transformers>=4.45"
+# (already present if you installed the Sana environment). Its optional
+# GDINO_TRT=1 TensorRT path uses the same torch-tensorrt build described in
+# the TensorRT note below.
 
 # Optional accelerators for BACKEND_MODE=sana — do NOT install from here
 # blindly; versions must match the torch/CUDA stack from Sana's

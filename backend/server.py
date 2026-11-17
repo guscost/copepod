@@ -7,8 +7,8 @@ Backends (BACKEND_MODE env var), each exposing the same interface
 (``process_frame(jpeg_bytes) -> jpeg_bytes``, ``reset()``,
 ``set_prompt(text)``, ``prompt``):
 
-  * "detect" (default): YOLO logo/ad detection + blanking
-    (detect_pipeline.py) — only alters detected regions; much faster and
+  * "detect" (default): logo/ad detection (YOLO-World or Grounding DINO)
+    + blanking (detect_pipeline.py) — only alters detected regions; much faster and
     lower latency.
   * "sana": SANA-Streaming diffusion V2V (sana_pipeline.py) — regenerates
     every frame from a text prompt.
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     if BACKEND_MODE == "detect":
         from detect_pipeline import DetectorPipeline
 
-        print(f"Loading YOLO detector backend on {device}...", flush=True)
+        print(f"Loading object-detector backend on {device}...", flush=True)
         backend = DetectorPipeline(device)
     elif BACKEND_MODE == "sana":
         from sana_pipeline import SanaBackend

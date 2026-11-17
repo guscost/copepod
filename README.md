@@ -3,12 +3,13 @@
 Real-time video-to-video processing over FastAPI WebSockets, with two
 selectable backends (`BACKEND_MODE` env var):
 
-- **`detect`** (default): YOLO logo/ad detection + blanking — detects logos and
-  advertising, tracks the boxes across frames, and composites a fill (black
-  square by default) over just those regions. Untouched pixels pass through
-  unmodified. This is the right tool when the goal is "find logos/ads and
-  blank them": it runs at full webcam framerate with millisecond latency,
-  which full-frame diffusion cannot sustain.
+- **`detect`** (default): logo/ad detection + blanking — detects logos and
+  advertising with a zero-shot detector (YOLO-World by default, or the
+  heavier/more accurate Grounding DINO), tracks the boxes across frames, and
+  composites a fill (black square by default) over just those regions.
+  Untouched pixels pass through unmodified. This is the right tool when the
+  goal is "find logos/ads and blank them": it runs at full webcam framerate
+  with millisecond latency, which full-frame diffusion cannot sustain.
 - **`sana`**: SANA-Streaming diffusion V2V — regenerates every frame from a
   text prompt (`BACKEND_MODE=sana`).
 
@@ -46,8 +47,8 @@ torch/diffusers/transformers yourself — versions must match
 `Sana-main/pyproject.toml`.
 
 Code layout: `server.py` is just the websocket/API plumbing; the two backends
-live in `sana_pipeline.py` (diffusion V2V) and `detect_pipeline.py` (YOLO
-blanking), each exposing `process_frame` / `reset` / `set_prompt` / `prompt`.
+live in `sana_pipeline.py` (diffusion V2V) and `detect_pipeline.py` (detection
++ blanking), each exposing `process_frame` / `reset` / `set_prompt` / `prompt`.
 
 ### Detector backend (logo/ad blanking, default)
 
@@ -77,10 +78,42 @@ FILL_MODE=blur     # black | white | blur | debug (debug draws boxes+labels, no 
 DETECT_EVERY=2
 ```
 
-With the YOLO-World model, the "Apply Prompt" box doubles as a class editor:
+With a zero-shot model, the "Apply Prompt" box doubles as a class editor:
 enter a comma-separated class list (e.g. `nike logo, adidas logo`) and click
 Apply. Tune classes/confidence with `FILL_MODE=debug` first so you can see
 exactly what the detector is finding.
+
+#### Grounding DINO mode (heavier, more accurate)
+
+Any `YOLO_MODEL` name containing `grounding` switches the detector from YOLO
+to Grounding DINO, a zero-shot transformer detector that is considerably more
+accurate than YOLO-World on ambiguous classes like "logo" — fewer false
+positives, tighter boxes — while still running at ~30+ fps in fp16 on a
+high-end GPU (use `DETECT_EVERY=2` for extra headroom):
+
+```bash
+pip install "transformers>=4.45"   # already present in the Sana environment
+YOLO_MODEL=IDEA-Research/grounding-dino-tiny python server.py
+```
+
+The weights auto-download from Hugging Face on first run. The same knobs
+apply (`DETECT_CLASSES`, the prompt box, `FILL_MODE`, ...), with two extras:
+
+```bash
+# Token-to-phrase matching threshold (default 0.25; DETECT_CONF is the box threshold)
+GDINO_TEXT_THRESHOLD=0.3
+
+# Force fp32 instead of the default fp16 on CUDA
+GDINO_FP16=0
+
+# Experimental: compile the detector with Torch-TensorRT (~2x over eager fp16
+# once compiled). Needs a torch-tensorrt build matching your torch/CUDA (see
+# requirements.txt). Compilation happens on the warmup frame at startup, so
+# set FRAME_WIDTH/FRAME_HEIGHT to the actual incoming frame size (default
+# 1280x720) — a different first-frame size triggers a slow recompile. A failed
+# TensorRT call permanently falls back to eager rather than killing the stream.
+GDINO_TRT=1 FRAME_WIDTH=1280 FRAME_HEIGHT=720 python server.py
+```
 
 ### Reducing GPU load / power draw
 
