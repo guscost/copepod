@@ -177,6 +177,12 @@ def _patch_views_in_module(module, tag):
             src = textwrap.dedent(inspect.getsource(forward))
             if ".view(" not in src:
                 continue
+            # Drop decorator lines (e.g. transformers' @auto_docstring):
+            # re-executing them against a plain function can fail, and the
+            # class already carries the decorated metadata.
+            src = "\n".join(
+                line for line in src.splitlines() if not line.lstrip().startswith("@")
+            )
             ns = {}
             exec(
                 compile(src.replace(".view(", ".reshape("), f"<{tag}-trt-patch>", "exec"),
@@ -184,8 +190,8 @@ def _patch_views_in_module(module, tag):
                 ns,
             )
             cls.forward = ns["forward"]
-        except (OSError, TypeError, SyntaxError):
-            pass  # source unavailable; TRT will fall back to eager if it fails
+        except Exception:
+            pass  # source unavailable/unpatchable; TRT falls back to eager if it fails
 
 
 def _patch_swin_for_trt():
