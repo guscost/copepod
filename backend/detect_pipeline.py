@@ -51,8 +51,8 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   incoming frame size, otherwise the first real frame pays a
                   recompile. A call that fails under TensorRT permanently
                   falls back to eager for the rest of the session. The
-                  workarounds also patch SwinSelfAttention's head merge
-                  (view->reshape) for the same mis-trace.
+                  workarounds also rewrite .view as .reshape in every Swin
+                  module forward for the same mis-trace.
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
                   boxes in between (default 1; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
@@ -152,15 +152,16 @@ class _IoUTracker:
 
 
 def _patch_swin_for_trt():
-    """Work around dynamo/Torch-TensorRT mis-traces of HF Swin's window ops.
+    """Work around dynamo/Torch-TensorRT mis-traces of HF Swin's reshapes.
 
-    window_partition/window_reverse and SwinSelfAttention's head merge end in
-    ``permute(...).contiguous().view(...)``; under torch.compile the tracer can
-    drop the contiguous() and then fail the view on the still-permuted strides
-    ("view size is not compatible with input tensor's size and stride").
-    Rewriting the final .view as .reshape forces a copy when the strides
-    require one. Numerically identical in eager (a reshape of contiguous data
-    is free), so the patch is safe to leave applied.
+    window_partition/window_reverse and several module forwards
+    (SwinSelfAttention's head merge, SwinLayer's un-pad slice + flatten, ...)
+    do ``permute/slice(...).contiguous().view(...)``; under torch.compile the
+    tracer can drop the contiguous() and then fail the view on the
+    still-strided tensor ("view size is not compatible with input tensor's
+    size and stride"). Rewriting the .view calls as .reshape forces a copy
+    when the strides require one. Numerically identical in eager (a reshape
+    of contiguous data is free), so the patch is safe to leave applied.
     """
     import transformers.models.swin.modeling_swin as swin
 
@@ -188,30 +189,33 @@ def _patch_swin_for_trt():
     swin.window_partition = window_partition
     swin.window_reverse = window_reverse
 
-    # SwinSelfAttention.forward merges heads with
-    # permute(0, 2, 1, 3).contiguous().view(...); AOT's metadata pass runs the
-    # traced graph on real tensors with contiguous() elided, so the view
-    # raises. window_partition/reverse are module-level functions and easy to
-    # rebind; this view sits mid-forward, so rewrite the method source with
-    # .view( -> .reshape( and rebind it (works across transformers versions;
-    # a reshape of already-contiguous data is free, so eager is unaffected).
+    # The same elided-contiguous mis-trace hits views inside several Swin
+    # module forwards (SwinSelfAttention's head merge, SwinLayer's un-pad
+    # slice + flatten, SwinEncoder's reshape before downsampling, ...). Those
+    # views sit mid-forward, so rewrite each forward's source with .view( ->
+    # .reshape( and rebind it. A reshape of already-contiguous data is free,
+    # so eager is numerically unaffected; doing it by source rewrite keeps it
+    # working across transformers versions.
     import inspect
     import textwrap
 
-    cls = getattr(swin, "SwinSelfAttention", None)
-    if cls is not None:
+    for cls in vars(swin).values():
+        if not (isinstance(cls, type) and cls.__module__ == swin.__name__):
+            continue
+        forward = cls.__dict__.get("forward")
+        if forward is None:
+            continue
         try:
-            src = textwrap.dedent(inspect.getsource(cls.forward))
-            if ".view(" in src:
-                ns = {}
-                exec(
-                    compile(
-                        src.replace(".view(", ".reshape("), "<swin-trt-patch>", "exec"
-                    ),
-                    swin.__dict__,
-                    ns,
-                )
-                cls.forward = ns["forward"]
+            src = textwrap.dedent(inspect.getsource(forward))
+            if ".view(" not in src:
+                continue
+            ns = {}
+            exec(
+                compile(src.replace(".view(", ".reshape("), "<swin-trt-patch>", "exec"),
+                swin.__dict__,
+                ns,
+            )
+            cls.forward = ns["forward"]
         except (OSError, TypeError, SyntaxError):
             pass  # source unavailable; TRT will fall back to eager if it fails
 
