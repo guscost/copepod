@@ -37,13 +37,26 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   force fp32). Eager runs under fp16 autocast, which keeps
                   fp32-only ops (LayerNorm, deformable-attention sampling,
                   contrastive heads) in fp32 instead of casting the whole
-                  model with .half(), avoiding float/half mismatches. With
-                  GDINO_TRT the engine is instead compiled with
-                  enabled_precisions={fp16}: the graph is traced in fp32
-                  (autocast disabled for the compiled call) and the TensorRT
-                  builder picks fp16 kernels itself — feeding it an
-                  autocast-traced graph compiles to an engine that emits
-                  NaN logits.
+                  model with .half(), avoiding float/half mismatches.
+                  Doubles as the default for GDINO_TRT_DTYPE.
+  GDINO_TRT_DTYPE Precision the TensorRT engine is compiled at: fp16
+                  (default when GDINO_FP16=1) | bf16 | fp32. The graph is
+                  always traced in fp32 (autocast disabled for the compiled
+                  call — feeding an autocast-traced graph to the compiler
+                  builds an engine that emits NaN logits) and the low
+                  precision is applied by Torch-TensorRT itself: rule-based
+                  autocast (enable_autocast + fp32 accumulation) on
+                  torch_tensorrt >= 2.15, enabled_precisions on older
+                  versions. Attention is also decomposed (matmul/softmax
+                  instead of TRT's fused kernel, which returns NaN on
+                  fully-masked rows in fp16 — pytorch/TensorRT#5011). bf16
+                  has fp32's exponent range — use it if fp16 logits come
+                  out NaN (fp16 overflows past 65504).
+  GDINO_TRT_TORCH_OPS
+                  Comma-separated aten ops to keep in eager PyTorch inside
+                  the compiled model (torch_executed_ops) — a bisection knob
+                  for localizing which op produces NaN/wrong output, e.g.
+                  "aten._softmax.default,aten.grid_sampler_2d.default".
   GDINO_TRT       Compile Grounding DINO with Torch-TensorRT (default 0;
                   experimental — roughly 2x throughput over eager fp16 once
                   compiled). Requires a torch-tensorrt build matching the
@@ -107,7 +120,20 @@ DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.15"))
 GDINO_TEXT_THRESHOLD = float(os.environ.get("GDINO_TEXT_THRESHOLD", "0.25"))
 GDINO_FP16 = os.environ.get("GDINO_FP16", "1") != "0"
 GDINO_TRT = os.environ.get("GDINO_TRT", "0") != "0"
+# Precision the TensorRT engine is compiled at: fp16 (default when
+# GDINO_FP16=1), bf16, or fp32. bf16 has fp32's exponent range, so if fp16
+# logits come out NaN the engine is overflowing fp16's 65504 max and bf16
+# keeps the speed without the overflow.
+GDINO_TRT_DTYPE = os.environ.get(
+    "GDINO_TRT_DTYPE", "fp16" if GDINO_FP16 else "fp32"
+).lower()
 GDINO_TRT_COMPARE = max(0, int(os.environ.get("GDINO_TRT_COMPARE", "8")))
+# Comma-separated aten ops to keep in eager PyTorch instead of TensorRT
+# (bisection knob for localizing a NaN/wrong-output op, e.g.
+# "aten._softmax.default,aten.grid_sampler_2d.default").
+GDINO_TRT_TORCH_OPS = {
+    op.strip() for op in os.environ.get("GDINO_TRT_TORCH_OPS", "").split(",") if op.strip()
+}
 GDINO_DEBUG = os.environ.get("GDINO_DEBUG", "0") != "0"
 DETECT_EVERY = max(1, int(os.environ.get("DETECT_EVERY", "1")))
 FILL_MODE = os.environ.get("FILL_MODE", "black")  # black|white|blur|debug
@@ -404,13 +430,44 @@ class DetectorPipeline:
                 functorch_config.generate_fake_kernels_from_real_mismatches = True
         except ImportError:
             pass
-        # fp16 is done through the TRT builder (enabled_precisions), not by
-        # tracing under autocast: an autocast-traced graph arrives with
-        # explicit fp16 casts and compiles to an engine that emits NaN logits
-        # (scores collapse vs eager). Tracing a clean fp32 graph and letting
-        # the builder pick fp16 kernels keeps fp32 accumulation where it
-        # matters and matches eager fp16 output.
-        options = {"enabled_precisions": {torch.float16}} if GDINO_FP16 else {}
+        # Reduced precision is done by the compiler, not by tracing under
+        # autocast: an autocast-traced graph arrives with explicit fp16 casts
+        # and compiles to an engine that emits NaN logits (scores collapse vs
+        # eager). Tracing a clean fp32 graph and letting Torch-TensorRT pick
+        # the low-precision kernels keeps fp32 accumulation where it matters.
+        # The option names changed at torch_tensorrt 2.15: enabled_precisions
+        # is silently ignored there (pytorch/TensorRT#5030) in favor of
+        # rule-based autocast, so detect which API this install speaks.
+        options = {}
+        low_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(GDINO_TRT_DTYPE)
+        if low_dtype is not None:
+            try:
+                import inspect
+
+                from torch_tensorrt.dynamo import compile as trt_dynamo_compile
+
+                params = inspect.signature(trt_dynamo_compile).parameters
+            except Exception:
+                params = {}
+            if "enable_autocast" in params:
+                options["enable_autocast"] = True
+                options["autocast_low_precision_type"] = low_dtype
+                if "use_fp32_acc" in params:
+                    # fp32 accumulation inside fp16 matmuls; cheap insurance
+                    # against accumulation-error NaNs.
+                    options["use_fp32_acc"] = True
+                if "decompose_attention" in params:
+                    # TRT's fused fp16 attention kernel returns NaN on
+                    # fully-masked rows (pytorch/TensorRT#5011) — Grounding
+                    # DINO's text padding mask produces exactly those.
+                    # Decomposing attention into matmul/softmax ops routes
+                    # around the buggy kernel and, with use_fp32_acc, runs
+                    # the softmax in fp32.
+                    options["decompose_attention"] = True
+            else:
+                options["enabled_precisions"] = {low_dtype}
+        if GDINO_TRT_TORCH_OPS:
+            options["torch_executed_ops"] = set(GDINO_TRT_TORCH_OPS)
         compiled = torch.compile(
             model, backend="torch_tensorrt", dynamic=False, options=options
         )
@@ -425,8 +482,9 @@ class DetectorPipeline:
                 # dynamo backend builds a RuntimeSettings object that only does
                 # anything on TRT-RTX builds and warns about it otherwise.
                 # Autocast is disabled so the traced graph is pure fp32; the
-                # engine's own fp16 precision (enabled_precisions) handles the
-                # speedup. The eager fallback below still runs under autocast.
+                # engine's own reduced precision (the options above) handles
+                # the speedup. The eager fallback below still runs under
+                # autocast.
                 with warnings.catch_warnings(), torch.autocast("cuda", enabled=False):
                     warnings.filterwarnings(
                         "ignore", message="RuntimeSettings is only honored.*"
@@ -584,14 +642,36 @@ class DetectorPipeline:
             f"eager={eager_top:.3f}, max logit diff {logit_diff:.3f}",
             flush=True,
         )
+        # When the engine diverges, say WHERE: scan every tensor field of the
+        # model output and name the ones where the compiled output has NaNs
+        # the eager output doesn't. That names the failing stage — e.g.
+        # encoder_last_hidden_state_vision = Swin backbone,
+        # encoder_last_hidden_state_text = BERT, last_hidden_state /
+        # intermediate_hidden_states = decoder (deformable attention),
+        # logits only = the contrastive class head.
+        nan_fields = [
+            k
+            for k in eager_outputs
+            if torch.is_tensor(eager_outputs[k])
+            and torch.is_tensor(outputs[k])
+            and eager_outputs[k].is_floating_point()
+            and outputs[k].shape == eager_outputs[k].shape
+            and outputs[k].isnan().sum().item() > eager_outputs[k].isnan().sum().item()
+        ]
+        if nan_fields:
+            print(
+                f"[tensorrt] gdino: NaN first appears in: {', '.join(nan_fields)}",
+                flush=True,
+            )
         # `not trt_top >= ...` (rather than `trt_top < ...`) so a NaN top
         # score from the compiled engine also counts as divergence.
         if eager_top >= DETECT_CONF and not trt_top >= eager_top * 0.5:
             print(
                 "[tensorrt] gdino: TensorRT output diverges from eager "
                 f"(trt top {trt_top:.3f} vs eager {eager_top:.3f}) — eager for "
-                "the rest of the session. To keep TensorRT, try GDINO_FP16=0 "
-                "(compiles in fp32).",
+                "the rest of the session. To keep TensorRT, try "
+                "GDINO_TRT_DTYPE=bf16 (same speed, fp32 exponent range) or "
+                "GDINO_TRT_DTYPE=fp32.",
                 flush=True,
             )
             self._gdino_forward.failed = True
