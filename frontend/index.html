@@ -55,7 +55,8 @@
         }
         video, canvas {
             width: 100%;
-            max-width: 512px;
+            max-width: 768px;
+            aspect-ratio: 16 / 9;
             border-radius: 8px;
             background: #000;
         }
@@ -141,13 +142,19 @@
         const statusEl = document.getElementById('status');
         const promptInput = document.getElementById('prompt');
         
+        // Stream frames at 16:9 (1280x720), matching the backend's default
+        // FRAME_WIDTH/FRAME_HEIGHT so its detector warmup compiles at the
+        // right size.
+        const STREAM_WIDTH = 1280;
+        const STREAM_HEIGHT = 720;
+
         // Offscreen canvas for frame extraction
         const hiddenCanvas = document.createElement('canvas');
         const hiddenCtx = hiddenCanvas.getContext('2d');
-        hiddenCanvas.width = 512;
-        hiddenCanvas.height = 512;
-        canvas.width = 512;
-        canvas.height = 512;
+        hiddenCanvas.width = STREAM_WIDTH;
+        hiddenCanvas.height = STREAM_HEIGHT;
+        canvas.width = STREAM_WIDTH;
+        canvas.height = STREAM_HEIGHT;
 
         // Backend address: override with ?server=host:port in the URL.
         const SERVER = new URLSearchParams(location.search).get('server') || 'localhost:8000';
@@ -166,9 +173,13 @@
 
         async function startStream() {
             try {
-                // Get webcam access
+                // Get webcam access, preferring a native 16:9 mode
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 512, height: 512 }
+                    video: {
+                        width: { ideal: STREAM_WIDTH },
+                        height: { ideal: STREAM_HEIGHT },
+                        aspectRatio: { ideal: STREAM_WIDTH / STREAM_HEIGHT }
+                    }
                 });
                 video.srcObject = stream;
                 
@@ -188,8 +199,8 @@
                     
                     img.onload = () => {
                         gotFirstResponse = true;
-                        ctx.clearRect(0, 0, 512, 512);
-                        ctx.drawImage(img, 0, 0, 512, 512);
+                        ctx.clearRect(0, 0, STREAM_WIDTH, STREAM_HEIGHT);
+                        ctx.drawImage(img, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
                         URL.revokeObjectURL(img.src);
                         isProcessing = false;
                         
@@ -247,7 +258,19 @@
                 ws && ws.readyState === WebSocket.OPEN && 
                 !isProcessing) {
                 
-                hiddenCtx.drawImage(video, 0, 0, 512, 512);
+                // Center-crop the webcam frame to 16:9 before scaling, so a
+                // non-16:9 camera (e.g. 4:3) isn't stretched.
+                const vw = video.videoWidth, vh = video.videoHeight;
+                const targetRatio = STREAM_WIDTH / STREAM_HEIGHT;
+                let sw = vw, sh = vh, sx = 0, sy = 0;
+                if (vw / vh > targetRatio) {
+                    sw = vh * targetRatio;
+                    sx = (vw - sw) / 2;
+                } else if (vw / vh < targetRatio) {
+                    sh = vw / targetRatio;
+                    sy = (vh - sh) / 2;
+                }
+                hiddenCtx.drawImage(video, sx, sy, sw, sh, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
                 
                 hiddenCanvas.toBlob((blob) => {
                     if (blob) {
