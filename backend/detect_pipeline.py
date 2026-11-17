@@ -43,16 +43,18 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   compiled). Requires a torch-tensorrt build matching the
                   installed torch/CUDA (see requirements.txt). Two dynamo
                   mis-trace workarounds are applied before compiling: HF
-                  Swin's window ops are patched (view->reshape), and
-                  fake-tensor real-tensor propagation is enabled so
-                  contiguous() isn't wrongly elided after permutes.
+                  Swin's window ops and the view() calls in Swin and
+                  Grounding DINO module forwards are patched
+                  (view->reshape), and fake-tensor real-tensor propagation
+                  is enabled so contiguous() isn't wrongly elided after
+                  permutes.
                   Compilation is lazy and happens on the warmup frame, so set
                   FRAME_WIDTH / FRAME_HEIGHT (default 1280x720) to the actual
                   incoming frame size, otherwise the first real frame pays a
                   recompile. A call that fails under TensorRT permanently
                   falls back to eager for the rest of the session. The
                   workarounds also rewrite .view as .reshape in every Swin
-                  module forward for the same mis-trace.
+                  and Grounding DINO module forward for the same mis-trace.
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
                   boxes in between (default 1; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
@@ -151,6 +153,41 @@ class _IoUTracker:
         return ids
 
 
+def _patch_views_in_module(module, tag):
+    """Rewrite .view( as .reshape( in every module forward defined in `module`.
+
+    The elided-contiguous mis-trace hits views inside several HF module
+    forwards (SwinSelfAttention's head merge, SwinLayer's un-pad slice +
+    flatten, GroundingDinoTextCrossAttention's head merge, ...). Those views
+    sit mid-forward, so rewrite each forward's source with .view( ->
+    .reshape( and rebind it. A reshape of already-contiguous data is free,
+    so eager is numerically unaffected; doing it by source rewrite keeps it
+    working across transformers versions.
+    """
+    import inspect
+    import textwrap
+
+    for cls in vars(module).values():
+        if not (isinstance(cls, type) and cls.__module__ == module.__name__):
+            continue
+        forward = cls.__dict__.get("forward")
+        if forward is None:
+            continue
+        try:
+            src = textwrap.dedent(inspect.getsource(forward))
+            if ".view(" not in src:
+                continue
+            ns = {}
+            exec(
+                compile(src.replace(".view(", ".reshape("), f"<{tag}-trt-patch>", "exec"),
+                module.__dict__,
+                ns,
+            )
+            cls.forward = ns["forward"]
+        except (OSError, TypeError, SyntaxError):
+            pass  # source unavailable; TRT will fall back to eager if it fails
+
+
 def _patch_swin_for_trt():
     """Work around dynamo/Torch-TensorRT mis-traces of HF Swin's reshapes.
 
@@ -189,35 +226,21 @@ def _patch_swin_for_trt():
     swin.window_partition = window_partition
     swin.window_reverse = window_reverse
 
-    # The same elided-contiguous mis-trace hits views inside several Swin
-    # module forwards (SwinSelfAttention's head merge, SwinLayer's un-pad
-    # slice + flatten, SwinEncoder's reshape before downsampling, ...). Those
-    # views sit mid-forward, so rewrite each forward's source with .view( ->
-    # .reshape( and rebind it. A reshape of already-contiguous data is free,
-    # so eager is numerically unaffected; doing it by source rewrite keeps it
-    # working across transformers versions.
-    import inspect
-    import textwrap
+    _patch_views_in_module(swin, "swin")
 
-    for cls in vars(swin).values():
-        if not (isinstance(cls, type) and cls.__module__ == swin.__name__):
-            continue
-        forward = cls.__dict__.get("forward")
-        if forward is None:
-            continue
-        try:
-            src = textwrap.dedent(inspect.getsource(forward))
-            if ".view(" not in src:
-                continue
-            ns = {}
-            exec(
-                compile(src.replace(".view(", ".reshape("), "<swin-trt-patch>", "exec"),
-                swin.__dict__,
-                ns,
-            )
-            cls.forward = ns["forward"]
-        except (OSError, TypeError, SyntaxError):
-            pass  # source unavailable; TRT will fall back to eager if it fails
+
+def _patch_grounding_dino_for_trt():
+    """Same mis-trace in Grounding DINO's own attention modules.
+
+    GroundingDinoTextCrossAttention (and the other attention classes in the
+    model file) do ``context_layer.permute(0, 2, 1, 3).contiguous().view(...)``
+    to merge attention heads; under AOT export the contiguous() can be elided
+    and the view then fails on the still-strided tensor, aborting the whole
+    TRT compilation.
+    """
+    import transformers.models.grounding_dino.modeling_grounding_dino as gdino
+
+    _patch_views_in_module(gdino, "gdino")
 
 
 class DetectorPipeline:
@@ -296,6 +319,7 @@ class DetectorPipeline:
         self.gdino.eval()
         if GDINO_TRT and device.type == "cuda":
             _patch_swin_for_trt()
+            _patch_grounding_dino_for_trt()
             self._gdino_forward = self._trt_wrap(self.gdino)
         else:
             self._gdino_forward = self.gdino
@@ -334,7 +358,8 @@ class DetectorPipeline:
                 flush=True,
             )
             return model
-        # HF Swin does permute(...).contiguous().view(...) in several places
+        # HF Swin and Grounding DINO attention do
+        # permute(...).contiguous().view(...) in several places
         # (window_partition/reverse, the self-attention output merge, ...).
         # Dynamo's fake-tensor stride propagation can wrongly conclude the
         # permuted tensor is already contiguous, elide contiguous() from the
