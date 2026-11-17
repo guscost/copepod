@@ -41,9 +41,11 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
   GDINO_TRT       Compile Grounding DINO with Torch-TensorRT (default 0;
                   experimental — roughly 2x throughput over eager fp16 once
                   compiled). Requires a torch-tensorrt build matching the
-                  installed torch/CUDA (see requirements.txt). HF Swin's
-                  window ops are patched (view->reshape) before compiling to
-                  work around a dynamo mis-trace of permuted strides.
+                  installed torch/CUDA (see requirements.txt). Two dynamo
+                  mis-trace workarounds are applied before compiling: HF
+                  Swin's window ops are patched (view->reshape), and
+                  fake-tensor real-tensor propagation is enabled so
+                  contiguous() isn't wrongly elided after permutes.
                   Compilation is lazy and happens on the warmup frame, so set
                   FRAME_WIDTH / FRAME_HEIGHT (default 1280x720) to the actual
                   incoming frame size, otherwise the first real frame pays a
@@ -284,6 +286,23 @@ class DetectorPipeline:
                 flush=True,
             )
             return model
+        # HF Swin does permute(...).contiguous().view(...) in several places
+        # (window_partition/reverse, the self-attention output merge, ...).
+        # Dynamo's fake-tensor stride propagation can wrongly conclude the
+        # permuted tensor is already contiguous, elide contiguous() from the
+        # traced graph, and then fail the view downstream ("Cannot view a
+        # tensor with shape ... and strides ..."). Propagating real tensors
+        # during tracing computes correct strides so contiguous() survives.
+        # Tracing gets slower, but it happens once, on the warmup frame.
+        try:
+            from torch._functorch import config as functorch_config
+
+            if hasattr(functorch_config, "fake_tensor_propagate_real_tensors"):
+                functorch_config.fake_tensor_propagate_real_tensors = True
+            if hasattr(functorch_config, "generate_fake_kernels_from_real_mismatches"):
+                functorch_config.generate_fake_kernels_from_real_mismatches = True
+        except ImportError:
+            pass
         compiled = torch.compile(model, backend="torch_tensorrt", dynamic=False)
         failed = False
 
