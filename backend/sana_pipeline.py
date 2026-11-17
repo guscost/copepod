@@ -16,7 +16,6 @@ Architecture notes:
 
 import copy
 import functools
-import importlib.util
 import io
 import os
 import sys
@@ -113,7 +112,7 @@ _trt_logged: set[str] = set()
 
 
 def _trt_compile(fn, component: str, label: str):
-    """Wrap ``fn`` in torch.compile(backend="tensorrt") when its component is enabled.
+    """Wrap ``fn`` in torch.compile(backend="torch_tensorrt") when its component is enabled.
 
     Compilation is lazy (it happens on the first call), so the wrapper catches
     a failure from any compiled call and permanently falls back to the eager
@@ -122,10 +121,10 @@ def _trt_compile(fn, component: str, label: str):
     if not (TENSORRT_COMPONENTS & {component, "all"}):
         return fn
     try:
-        trt_installed = importlib.util.find_spec("torch_tensorrt") is not None
-    except ValueError:  # present in sys.modules without a spec — treat as installed
-        trt_installed = True
-    if not trt_installed:
+        # The import registers "torch_tensorrt" as a torch.compile backend;
+        # without it torch.compile raises InvalidBackend.
+        import torch_tensorrt  # noqa: F401
+    except ImportError:
         if component not in _trt_logged:
             _trt_logged.add(component)
             print(
@@ -134,7 +133,7 @@ def _trt_compile(fn, component: str, label: str):
                 flush=True,
             )
         return fn
-    compiled = torch.compile(fn, backend="tensorrt", dynamic=False)
+    compiled = torch.compile(fn, backend="torch_tensorrt", dynamic=False)
     failed = False
 
     @functools.wraps(fn)

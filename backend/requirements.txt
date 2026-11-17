@@ -24,6 +24,11 @@ ultralytics>=8.3
 # blindly; versions must match the torch/CUDA stack from Sana's
 # environment_setup.sh (which already installs xformers + flash-attn):
 #   xformers==0.0.36           # memory-efficient attention (on by default; DISABLE_XFORMERS=1 opts out)
-# Experimental TensorRT path (TENSORRT=vae,text_encoder): install the
-# torch-tensorrt build matching this torch/CUDA stack, e.g.
+# Experimental TensorRT path (TENSORRT=vae,text_encoder; GDINO_TRT=1 for the
+# detect backend): install the torch-tensorrt build matching this torch/CUDA
+# stack, e.g.
 #   pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132
+# The torch.compile backend only registers once torch_tensorrt is imported;
+# verify with:
+#   python -c "import torch, torch_tensorrt; print(torch._dynamo.list_backends())"
+# ('torch_tensorrt' should appear in the list)

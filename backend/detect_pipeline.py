@@ -67,7 +67,6 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   smooth jitter more but lag behind fast-moving ads.
 """
 
-import importlib.util
 import io
 import os
 import time
@@ -226,7 +225,7 @@ class DetectorPipeline:
 
     @staticmethod
     def _trt_wrap(model):
-        """Wrap the Grounding DINO forward in torch.compile(backend="tensorrt").
+        """Wrap the Grounding DINO forward in torch.compile(backend="torch_tensorrt").
 
         Compilation is lazy (first call), so the wrapper catches a failure
         from any compiled call and permanently falls back to the eager model —
@@ -236,17 +235,17 @@ class DetectorPipeline:
         import torch
 
         try:
-            trt_installed = importlib.util.find_spec("torch_tensorrt") is not None
-        except ValueError:  # present in sys.modules without a spec — treat as installed
-            trt_installed = True
-        if not trt_installed:
+            # The import registers "torch_tensorrt" as a torch.compile
+            # backend; without it torch.compile raises InvalidBackend.
+            import torch_tensorrt  # noqa: F401
+        except ImportError:
             print(
                 "[tensorrt] gdino: torch-tensorrt not installed; staying eager "
                 "(install a torch-tensorrt build matching your torch/CUDA to enable)",
                 flush=True,
             )
             return model
-        compiled = torch.compile(model, backend="tensorrt", dynamic=False)
+        compiled = torch.compile(model, backend="torch_tensorrt", dynamic=False)
         failed = False
 
         def wrapper(*args, **kwargs):
