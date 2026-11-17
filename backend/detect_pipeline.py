@@ -629,6 +629,8 @@ class DetectorPipeline:
         """
         if not self._trt_checks or getattr(self._gdino_forward, "failed", True):
             return outputs
+        import torch
+
         self._trt_checks -= 1
         eager_outputs = self.gdino(**inputs)
         if not (hasattr(outputs, "logits") and hasattr(eager_outputs, "logits")):
