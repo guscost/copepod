@@ -50,7 +50,9 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   FRAME_WIDTH / FRAME_HEIGHT (default 1280x720) to the actual
                   incoming frame size, otherwise the first real frame pays a
                   recompile. A call that fails under TensorRT permanently
-                  falls back to eager for the rest of the session.
+                  falls back to eager for the rest of the session. The
+                  workarounds also patch SwinSelfAttention's head merge
+                  (view->reshape) for the same mis-trace.
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
                   boxes in between (default 1; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
@@ -150,14 +152,15 @@ class _IoUTracker:
 
 
 def _patch_swin_for_trt():
-    """Work around a dynamo/Torch-TensorRT mis-trace of HF Swin's window ops.
+    """Work around dynamo/Torch-TensorRT mis-traces of HF Swin's window ops.
 
-    window_partition/window_reverse end in ``permute(...).contiguous().view(...)``;
-    under torch.compile the tracer can drop the contiguous() and then fail the
-    view on the still-permuted strides ("Cannot view a tensor with shape ...
-    and strides ..."). Rewriting the final .view as .reshape forces a copy
-    when the strides require one. Numerically identical in eager (a reshape
-    of contiguous data is free), so the patch is safe to leave applied.
+    window_partition/window_reverse and SwinSelfAttention's head merge end in
+    ``permute(...).contiguous().view(...)``; under torch.compile the tracer can
+    drop the contiguous() and then fail the view on the still-permuted strides
+    ("view size is not compatible with input tensor's size and stride").
+    Rewriting the final .view as .reshape forces a copy when the strides
+    require one. Numerically identical in eager (a reshape of contiguous data
+    is free), so the patch is safe to leave applied.
     """
     import transformers.models.swin.modeling_swin as swin
 
@@ -184,6 +187,33 @@ def _patch_swin_for_trt():
 
     swin.window_partition = window_partition
     swin.window_reverse = window_reverse
+
+    # SwinSelfAttention.forward merges heads with
+    # permute(0, 2, 1, 3).contiguous().view(...); AOT's metadata pass runs the
+    # traced graph on real tensors with contiguous() elided, so the view
+    # raises. window_partition/reverse are module-level functions and easy to
+    # rebind; this view sits mid-forward, so rewrite the method source with
+    # .view( -> .reshape( and rebind it (works across transformers versions;
+    # a reshape of already-contiguous data is free, so eager is unaffected).
+    import inspect
+    import textwrap
+
+    cls = getattr(swin, "SwinSelfAttention", None)
+    if cls is not None:
+        try:
+            src = textwrap.dedent(inspect.getsource(cls.forward))
+            if ".view(" in src:
+                ns = {}
+                exec(
+                    compile(
+                        src.replace(".view(", ".reshape("), "<swin-trt-patch>", "exec"
+                    ),
+                    swin.__dict__,
+                    ns,
+                )
+                cls.forward = ns["forward"]
+        except (OSError, TypeError, SyntaxError):
+            pass  # source unavailable; TRT will fall back to eager if it fails
 
 
 class DetectorPipeline:
@@ -243,14 +273,22 @@ class DetectorPipeline:
         self._detect(np.zeros((warm_h, warm_w, 3), dtype=np.uint8))
 
     def _init_gdino(self, device):
+        import warnings
+
         import torch
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-        self.processor = AutoProcessor.from_pretrained(YOLO_MODEL)
-        # Weights stay in fp32; fp16 happens via autocast at inference time so
-        # fp32-only ops don't hit float/half mismatches.
-        self._gdino_amp = device.type == "cuda" and GDINO_FP16
-        self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(device)
+        # transformers builds Grounding DINO's deformable-attention op with
+        # torch.jit.script, which now emits a FutureWarning on every load.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*torch.jit.script is deprecated.*", category=FutureWarning
+            )
+            self.processor = AutoProcessor.from_pretrained(YOLO_MODEL)
+            # Weights stay in fp32; fp16 happens via autocast at inference
+            # time so fp32-only ops don't hit float/half mismatches.
+            self._gdino_amp = device.type == "cuda" and GDINO_FP16
+            self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(device)
         self.gdino.eval()
         if GDINO_TRT and device.type == "cuda":
             _patch_swin_for_trt()
@@ -273,12 +311,18 @@ class DetectorPipeline:
         a bad graph can never kill the stream. Same policy as sana_pipeline's
         TENSORRT path.
         """
+        import contextlib
+        import warnings
+
         import torch
 
         try:
             # The import registers "torch_tensorrt" as a torch.compile
-            # backend; without it torch.compile raises InvalidBackend.
-            import torch_tensorrt  # noqa: F401
+            # backend; without it torch.compile raises InvalidBackend. It
+            # also prints "Unable to import quantiz(e/ation) op... modelopt"
+            # noise that only matters when compiling quantized models.
+            with contextlib.redirect_stdout(io.StringIO()):
+                import torch_tensorrt  # noqa: F401
         except ImportError:
             print(
                 "[tensorrt] gdino: torch-tensorrt not installed; staying eager "
@@ -311,7 +355,14 @@ class DetectorPipeline:
             if failed:
                 return model(*args, **kwargs)
             try:
-                return compiled(*args, **kwargs)
+                # Compilation happens lazily inside this call. torch_tensorrt's
+                # dynamo backend builds a RuntimeSettings object that only does
+                # anything on TRT-RTX builds and warns about it otherwise.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="RuntimeSettings is only honored.*"
+                    )
+                    return compiled(*args, **kwargs)
             except Exception as e:
                 failed = True
                 print(
