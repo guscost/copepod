@@ -4,15 +4,21 @@ Real-time video-to-video processing over FastAPI WebSockets.
 
 ## Quickstart
 
-For the default ad-blocking YOLO models, install the CUDA toolkit (13.2 is tested), torch, and the normal items in backend/requirements.txt, then in the backend folder run:
+For the default ad-blocking fine-tuned YOLO detector, install the CUDA toolkit (13.2 is tested), torch, and the normal items in backend/requirements.txt, then in the backend folder run:
 
 ```
 python server.py
 ```
 
+For freeform detection, try the YOLOv8 World 2 model:
+
+```
+YOLO_MODEL=yolov8s-worldv2.pt python server.py
+```
+
 Open frontend/index.html, and start the webcam stream.
 
-## Grounding DINO for general detection
+## Grounding DINO for better general detection
 
 Add `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run e.g. (for a 5090):
 
