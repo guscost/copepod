@@ -17,7 +17,7 @@ Open frontend/index.html, and start the webcam stream.
 Add `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run e.g. (for a 5090):
 
 ```
-DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.5 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
+DETECT_EVERY=2 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.3 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
 ```
 
 ## Modes
