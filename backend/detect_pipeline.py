@@ -55,6 +55,15 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   falls back to eager for the rest of the session. The
                   workarounds also rewrite .view as .reshape in every Swin
                   and Grounding DINO module forward for the same mis-trace.
+  GDINO_TRT_COMPARE  With GDINO_TRT, also run the eager model on the first N
+                  frames (default 8) and compare raw logit scores against the
+                  compiled output. A compiled engine that silently degrades
+                  (scores collapsed/NaN under TensorRT while eager still
+                  detects) is logged and permanently swapped back to eager.
+                  The comparison doubles detect cost for those N frames; set
+                  0 to disable.
+  GDINO_DEBUG   Log raw per-frame detection count and top scores before
+                  tracking/filtering (default 0).
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
                   boxes in between (default 1; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
@@ -92,6 +101,8 @@ DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.15"))
 GDINO_TEXT_THRESHOLD = float(os.environ.get("GDINO_TEXT_THRESHOLD", "0.25"))
 GDINO_FP16 = os.environ.get("GDINO_FP16", "1") != "0"
 GDINO_TRT = os.environ.get("GDINO_TRT", "0") != "0"
+GDINO_TRT_COMPARE = max(0, int(os.environ.get("GDINO_TRT_COMPARE", "8")))
+GDINO_DEBUG = os.environ.get("GDINO_DEBUG", "0") != "0"
 DETECT_EVERY = max(1, int(os.environ.get("DETECT_EVERY", "1")))
 FILL_MODE = os.environ.get("FILL_MODE", "black")  # black|white|blur|debug
 BOX_DILATE = float(os.environ.get("BOX_DILATE", "0.1"))
@@ -303,7 +314,10 @@ class DetectorPipeline:
             warm_w = int(os.environ.get("FRAME_WIDTH", "1280"))
         else:
             warm_h, warm_w = 512, 512
+        self._warm_shape = (warm_h, warm_w)
+        self._shape_logged = True  # suppress the frame-size log for the warmup
         self._detect(np.zeros((warm_h, warm_w, 3), dtype=np.uint8))
+        self._shape_logged = False  # ... then log it for the first real frame
 
     def _init_gdino(self, device):
         import warnings
@@ -327,8 +341,10 @@ class DetectorPipeline:
             _patch_swin_for_trt()
             _patch_grounding_dino_for_trt()
             self._gdino_forward = self._trt_wrap(self.gdino)
+            self._trt_checks = GDINO_TRT_COMPARE
         else:
             self._gdino_forward = self.gdino
+            self._trt_checks = 0
         self._iou_tracker = _IoUTracker()
         mode = "fp16 autocast" if self._gdino_amp else "fp32"
         print(
@@ -383,11 +399,11 @@ class DetectorPipeline:
         except ImportError:
             pass
         compiled = torch.compile(model, backend="torch_tensorrt", dynamic=False)
-        failed = False
 
         def wrapper(*args, **kwargs):
-            nonlocal failed
-            if failed:
+            # `failed` is an attribute (not a closure flag) so the eager/TRT
+            # score cross-check in _detect_gdino can also force the fallback.
+            if wrapper.failed:
                 return model(*args, **kwargs)
             try:
                 # Compilation happens lazily inside this call. torch_tensorrt's
@@ -399,13 +415,15 @@ class DetectorPipeline:
                     )
                     return compiled(*args, **kwargs)
             except Exception as e:
-                failed = True
+                wrapper.failed = True
                 print(
                     f"[tensorrt] gdino failed under TensorRT ({e}); "
                     "eager for the rest of the session",
                     flush=True,
                 )
                 return model(*args, **kwargs)
+
+        wrapper.failed = False
 
         print(
             "[tensorrt] gdino: Torch-TensorRT enabled (compiles on warmup frame)",
@@ -469,6 +487,19 @@ class DetectorPipeline:
     def _detect_gdino(self, frame: np.ndarray):
         import torch
 
+        if not self._shape_logged:
+            self._shape_logged = True
+            h, w = frame.shape[:2]
+            note = ""
+            if GDINO_TRT and (h, w) != self._warm_shape:
+                wh, ww = self._warm_shape
+                note = (
+                    f" — differs from the {ww}x{wh} warmup, so the first frame "
+                    f"recompiles; set FRAME_WIDTH={w} FRAME_HEIGHT={h} to compile "
+                    "at the right size"
+                )
+            print(f"[detect] incoming frame: {w}x{h}{note}", flush=True)
+
         image = Image.fromarray(frame)
         # Grounding DINO prompt format: lowercase phrases, period-separated.
         text = ". ".join(c.lower() for c in self.classes) + "."
@@ -478,6 +509,7 @@ class DetectorPipeline:
             amp_device, dtype=torch.float16, enabled=self._gdino_amp
         ):
             outputs = self._gdino_forward(**inputs)
+            outputs = self._trt_cross_check(inputs, outputs)
         kwargs = dict(
             input_ids=inputs["input_ids"],
             text_threshold=GDINO_TEXT_THRESHOLD,
@@ -497,11 +529,63 @@ class DetectorPipeline:
         scores = res["scores"].cpu().numpy()
         # transformers >= 4.51 deprecates string "labels" in favor of "text_labels".
         labels = res["text_labels"] if "text_labels" in res else res["labels"]
+        if GDINO_DEBUG:
+            top = sorted(zip(scores, labels), reverse=True)[:3]
+            top_str = ", ".join(f"{label} {float(score):.3f}" for score, label in top)
+            print(
+                f"[detect] raw: {len(boxes)} box(es)"
+                + (f" (top: {top_str})" if top else ""),
+                flush=True,
+            )
         ids = self._iou_tracker.update(boxes)
         return [
             (track_id, x1, y1, x2, y2, float(conf), label)
             for track_id, (x1, y1, x2, y2), conf, label in zip(ids, boxes, scores, labels)
         ]
+
+    def _trt_cross_check(self, inputs, outputs):
+        """Compare TRT-compiled logits against an eager run on the same frame.
+
+        Runs for the first GDINO_TRT_COMPARE frames while the compiled path
+        is active. A silently-degraded engine (top score collapsed or NaN
+        while eager still clears the threshold) is logged and swapped back to
+        eager for the rest of the session.
+        """
+        if not self._trt_checks or getattr(self._gdino_forward, "failed", True):
+            return outputs
+        self._trt_checks -= 1
+        eager_outputs = self.gdino(**inputs)
+        if not (hasattr(outputs, "logits") and hasattr(eager_outputs, "logits")):
+            self._trt_checks = 0  # unexpected output structure; stop checking
+            return outputs
+        trt_top = outputs.logits.sigmoid().max().item()
+        eager_top = eager_outputs.logits.sigmoid().max().item()
+        logit_diff = (outputs.logits - eager_outputs.logits).abs().max().item()
+        print(
+            f"[tensorrt] gdino cross-check: top score trt={trt_top:.3f} "
+            f"eager={eager_top:.3f}, max logit diff {logit_diff:.3f}",
+            flush=True,
+        )
+        # `not trt_top >= ...` (rather than `trt_top < ...`) so a NaN top
+        # score from the compiled engine also counts as divergence.
+        if eager_top >= DETECT_CONF and not trt_top >= eager_top * 0.5:
+            print(
+                "[tensorrt] gdino: TensorRT output diverges from eager "
+                f"(trt top {trt_top:.3f} vs eager {eager_top:.3f}) — eager for "
+                "the rest of the session. To keep TensorRT, try GDINO_FP16=0 "
+                "(compiles in fp32).",
+                flush=True,
+            )
+            self._gdino_forward.failed = True
+            self._trt_checks = 0
+            return eager_outputs
+        if not self._trt_checks:
+            print(
+                f"[tensorrt] gdino cross-check: {GDINO_TRT_COMPARE} frames "
+                "matched eager; running TensorRT only from here on",
+                flush=True,
+            )
+        return outputs
 
     def _update_tracks(self, detections, frame_shape):
         """Fuse one frame's raw detections into the persistent track state."""
