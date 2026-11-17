@@ -1,26 +1,30 @@
-"""YOLO-based logo/ad detection + blanking pipeline (alternative backend).
+"""Detector-based logo/ad detection + blanking pipeline (alternative backend).
 
 Instead of regenerating every frame with the SANA diffusion model, this
-pipeline detects logos and advertising with YOLO-World (zero-shot: detection
-classes are plain text) or a fine-tuned YOLO checkpoint, tracks the boxes
-across frames with ByteTrack, and composites a fill (black square by default)
-over the detected regions. Untouched pixels pass through unmodified, so the
-output matches the input everywhere except the blanked areas, and per-frame
-latency is a few milliseconds on a modern GPU.
+pipeline detects logos and advertising with a zero-shot detector (Grounding
+DINO by default; detection classes are plain text) or a fine-tuned YOLO
+checkpoint, tracks the boxes across frames (ByteTrack for YOLO, a lightweight
+IoU matcher for Grounding DINO), and composites a fill (black square by
+default) over the detected regions. Untouched pixels pass through unmodified,
+so the output matches the input everywhere except the blanked areas, and
+per-frame latency is a few milliseconds on a modern GPU.
 
 Selected with BACKEND_MODE=detect in server.py. Env knobs:
 
   YOLO_MODEL      Checkpoint path/name. Three flavors are supported:
-                  * contains "world" (default: yolov8s-worldv2.pt,
+                  * contains "grounding" (default:
+                    IDEA-Research/grounding-dino-base, auto-downloaded from
+                    Hugging Face on first run): Grounding DINO via
+                    transformers — a heavier zero-shot transformer detector
+                    with much better accuracy on ambiguous classes like
+                    "logo" (~30+ fps on a high-end GPU in fp16). Needs
+                    `pip install transformers`. Track ids come from a
+                    lightweight IoU matcher (Grounding DINO has no built-in
+                    tracker).
+                  * contains "world" (e.g. yolov8s-worldv2.pt,
                     auto-downloaded on first run): YOLO-World, zero-shot
-                    classes via set_classes(). Fastest, weakest.
-                  * contains "grounding" (e.g. IDEA-Research/grounding-dino-tiny):
-                    Grounding DINO via Hugging Face transformers — a heavier
-                    zero-shot transformer detector with much better accuracy
-                    on ambiguous classes like "logo" (~20-30 ms/frame on a
-                    high-end GPU in fp16). Needs `pip install transformers`.
-                    Track ids come from a lightweight IoU matcher (Grounding
-                    DINO has no built-in tracker).
+                    classes via set_classes(). Fastest, weakest — the
+                    lightweight option for weaker GPUs.
                   * anything else: a fine-tuned YOLO checkpoint, using the
                     classes it was trained on.
   DETECT_CLASSES  Comma-separated zero-shot classes (YOLO-World / Grounding
@@ -29,8 +33,11 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   conservatively; raise it if false positives appear). Doubles
                   as Grounding DINO's box threshold.
   GDINO_TEXT_THRESHOLD  Grounding DINO token-to-phrase threshold (0.25).
-  GDINO_FP16      Run Grounding DINO in fp16 on CUDA (default 1; set 0 to
-                  force fp32).
+  GDINO_FP16      Run Grounding DINO under fp16 autocast on CUDA (default 1;
+                  set 0 to force fp32). Autocast keeps fp32-only ops
+                  (LayerNorm, deformable-attention sampling, contrastive
+                  heads) in fp32 instead of casting the whole model with
+                  .half(), which avoids float/half mismatches.
   GDINO_TRT       Compile Grounding DINO with Torch-TensorRT (default 0;
                   experimental — roughly 2x throughput over eager fp16 once
                   compiled). Requires a torch-tensorrt build matching the
@@ -69,7 +76,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8s-worldv2.pt")
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "IDEA-Research/grounding-dino-base")
 DEFAULT_CLASSES = "logo,brand,corporate logo,brand logo,advertisement,billboard,sponsor,consumer product"
 DETECT_CLASSES = [
     c.strip() for c in os.environ.get("DETECT_CLASSES", DEFAULT_CLASSES).split(",") if c.strip()
@@ -200,10 +207,10 @@ class DetectorPipeline:
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(YOLO_MODEL)
-        dtype = torch.float16 if (device.type == "cuda" and GDINO_FP16) else torch.float32
-        self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(
-            device=device, dtype=dtype
-        )
+        # Weights stay in fp32; fp16 happens via autocast at inference time so
+        # fp32-only ops don't hit float/half mismatches.
+        self._gdino_amp = device.type == "cuda" and GDINO_FP16
+        self.gdino = AutoModelForZeroShotObjectDetection.from_pretrained(YOLO_MODEL).to(device)
         self.gdino.eval()
         self._gdino_forward = (
             self._trt_wrap(self.gdino)
@@ -211,8 +218,9 @@ class DetectorPipeline:
             else self.gdino
         )
         self._iou_tracker = _IoUTracker()
+        mode = "fp16 autocast" if self._gdino_amp else "fp32"
         print(
-            f"[detect] Grounding DINO zero-shot ({dtype}) classes: {self.classes}",
+            f"[detect] Grounding DINO zero-shot ({mode}) classes: {self.classes}",
             flush=True,
         )
 
@@ -322,8 +330,10 @@ class DetectorPipeline:
         # Grounding DINO prompt format: lowercase phrases, period-separated.
         text = ". ".join(c.lower() for c in self.classes) + "."
         inputs = self.processor(images=image, text=text, return_tensors="pt").to(self.device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(self.gdino.dtype)
-        with torch.inference_mode():
+        amp_device = "cuda" if self.device.type == "cuda" else "cpu"
+        with torch.inference_mode(), torch.autocast(
+            amp_device, dtype=torch.float16, enabled=self._gdino_amp
+        ):
             outputs = self._gdino_forward(**inputs)
         kwargs = dict(
             input_ids=inputs["input_ids"],

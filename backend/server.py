@@ -7,7 +7,7 @@ Backends (BACKEND_MODE env var), each exposing the same interface
 (``process_frame(jpeg_bytes) -> jpeg_bytes``, ``reset()``,
 ``set_prompt(text)``, ``prompt``):
 
-  * "detect" (default): logo/ad detection (YOLO-World or Grounding DINO)
+  * "detect" (default): logo/ad detection (Grounding DINO or YOLO)
     + blanking (detect_pipeline.py) — only alters detected regions; much faster and
     lower latency.
   * "sana": SANA-Streaming diffusion V2V (sana_pipeline.py) — regenerates

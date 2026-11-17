@@ -10,14 +10,15 @@ websockets>=12
 Pillow>=10.4
 pyrallis
 termcolor
-# Only needed for BACKEND_MODE=detect (YOLO logo/ad detection + blanking;
-# pulls in opencv-python). The YOLO-World weights auto-download on first run.
+# Only needed for BACKEND_MODE=detect (logo/ad detection + blanking).
+# The default detector is Grounding DINO (transformers; weights auto-download
+# from Hugging Face on first run — already present in the Sana environment).
+transformers>=4.45
+# YOLO mode (YOLO_MODEL=yolov8s-worldv2.pt or a fine-tuned checkpoint) needs
+# ultralytics (pulls in opencv-python); YOLO-World weights auto-download.
 ultralytics>=8.3
-# Grounding DINO mode (YOLO_MODEL=IDEA-Research/grounding-dino-tiny) also needs:
-#   pip install "transformers>=4.45"
-# (already present if you installed the Sana environment). Its optional
-# GDINO_TRT=1 TensorRT path uses the same torch-tensorrt build described in
-# the TensorRT note below.
+# The optional GDINO_TRT=1 TensorRT path uses the same torch-tensorrt build
+# described in the TensorRT note below.
 
 # Optional accelerators for BACKEND_MODE=sana — do NOT install from here
 # blindly; versions must match the torch/CUDA stack from Sana's
