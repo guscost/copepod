@@ -127,7 +127,9 @@ if TENSORRT_COMPONENTS - {"vae", "text_encoder", "all"}:
 # Bulk FFN-out/attention GEMMs go to Blackwell NVFP4 weight-only (block size
 # 16); the sensitive FFN fc1 and GDN linear layers go to MXFP8 dynamic
 # activation + weight (block size 32). Conditioning, embeddings, output heads,
-# and norms stay in bf16. NVFP4 needs a Blackwell GPU (sm_100+/sm_120).
+# and norms stay in bf16. NVFP4/MXFP8 use torchao's prototype mx_formats API
+# (needs a recent torchao and a Blackwell GPU, sm_100+/sm_120); older
+# torchao/GPUs degrade to int4 weight-only + int8 dynamic instead.
 TORCHAO_QUANT = os.environ.get("TORCHAO_QUANT", "0") == "1"
 
 _trt_logged: set[str] = set()
@@ -219,37 +221,75 @@ def _mxfp8_filter(module: torch.nn.Module, fqn: str) -> bool:
 
 
 def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
-    """Apply TorchAO microscaling quantization to the DiT in place."""
+    """Apply TorchAO microscaling quantization to the DiT in place.
+
+    Prefers the true Blackwell microscaling path (NVFP4 weight-only +
+    MXFP8 dynamic, from torchao's prototype mx_formats API) and degrades to
+    int4/int8 (stable torchao API) when the prototype configs are unavailable.
+    """
     try:
-        from torchao.quantization import (
-            Int8DynamicActivationInt8WeightConfig,
-            Int4WeightOnlyConfig,
-            quantize_,
-        )
-    except ImportError:
+        from torchao import __version__ as ao_version
+        from torchao.quantization import quantize_
+    except Exception as e:  # not just ImportError: broken CUDA extensions raise OSError/RuntimeError
         print(
-            "[quant] torchao not installed; DiT stays in bf16 "
-            "(pip install torchao to enable TORCHAO_QUANT=1)",
+            f"[quant] torchao not importable ({e}); DiT stays in bf16 "
+            "(install torchao matching your torch/CUDA to enable TORCHAO_QUANT=1)",
             flush=True,
         )
         return
+
+    nvfp4_config = None
+    mxfp8_config = None
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) < (10, 0):
+    if (major, minor) >= (10, 0):
+        try:
+            # The microscaling configs live in the prototype mx_formats API
+            # (they are NOT exported from torchao.quantization):
+            #   NVFP4WeightOnlyConfig            -> NVFP4 weight-only, block size 16
+            #   MXDynamicActivationMXWeightConfig-> MXFP8 dynamic act+weight, block size 32
+            #     (defaults: activation_dtype = weight_dtype = float8_e4m3fn)
+            from torchao.prototype.mx_formats.inference_workflow import (
+                MXDynamicActivationMXWeightConfig,
+                NVFP4WeightOnlyConfig,
+            )
+
+            nvfp4_config = NVFP4WeightOnlyConfig()
+            mxfp8_config = MXDynamicActivationMXWeightConfig(block_size=32)
+        except Exception as e:
+            print(
+                f"[quant] torchao {ao_version} lacks the prototype MX/NVFP4 configs ({e}); "
+                "upgrade torchao for the Blackwell microscaling path — falling back to int4/int8",
+                flush=True,
+            )
+    else:
         print(
-            f"[quant] NVFP4 needs a Blackwell GPU (sm_100+); this is sm_{major}{minor}; "
-            "DiT stays in bf16",
+            f"[quant] NVFP4/MXFP8 microscaling needs a Blackwell GPU (sm_100+); "
+            f"this is sm_{major}{minor} — falling back to int4/int8",
             flush=True,
         )
-        return
+
+    if nvfp4_config is None:
+        from torchao.quantization import (
+            Int4WeightOnlyConfig,
+            Int8DynamicActivationInt8WeightConfig,
+        )
+
+        nvfp4_config = Int4WeightOnlyConfig()
+        mxfp8_config = Int8DynamicActivationInt8WeightConfig()
+
     try:
-        # 1. Bulk FFN output/attention GEMMs -> Blackwell NVFP4 (block size 16)
-        quantize_(model, Int4WeightOnlyConfig(), filter_fn=_sana_blackwell_filter)
-        # 2. Sensitive FFN fc1 & GDN linear layers -> MXFP8 (block size 32)
-        quantize_(model, Int8DynamicActivationInt8WeightConfig(), filter_fn=_mxfp8_filter)
+        # 1. Bulk FFN output/attention GEMMs -> NVFP4 weight-only (block size 16)
+        quantize_(model, nvfp4_config, filter_fn=_sana_blackwell_filter)
+        # 2. Sensitive FFN fc1 & GDN linear layers -> MXFP8 dynamic (block size 32)
+        quantize_(model, mxfp8_config, filter_fn=_mxfp8_filter)
     except Exception as e:
         print(f"[quant] TorchAO quantization failed ({e}); continuing anyway", flush=True)
         return
-    print("[quant] DiT quantized: NVFP4 weight-only (bulk GEMMs) + MXFP8 dynamic (fc1/GDN)", flush=True)
+    print(
+        f"[quant] DiT quantized (torchao {ao_version}): "
+        f"{type(nvfp4_config).__name__} (bulk GEMMs) + {type(mxfp8_config).__name__} (fc1/GDN)",
+        flush=True,
+    )
 
 
 @dataclass

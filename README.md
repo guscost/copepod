@@ -224,12 +224,14 @@ Status of the usual inference optimizations in this stack:
   torch-tensorrt build matching the installed torch/CUDA (see
   `backend/requirements.txt`). The DiT is not compilable this way — its
   stateful KV cache and Triton GDN kernels don't survive graph capture.
-- **TorchAO microscaling quantization** (experimental, opt-in, Blackwell
-  only): `TORCHAO_QUANT=1` quantizes the DiT with NVFP4 weight-only (block
-  size 16) for bulk FFN-out/attention GEMMs and MXFP8 dynamic (block size 32)
-  for the sensitive FFN fc1 and GDN linear layers; conditioning, embeddings,
-  output heads, and norms stay in bf16. Requires `torchao` and a Blackwell
-  GPU (sm_100+/sm_120); falls back to bf16 otherwise. Baseline remains bf16
+- **TorchAO microscaling quantization** (experimental, opt-in): `TORCHAO_QUANT=1`
+  quantizes the DiT with NVFP4 weight-only (block size 16) for bulk
+  FFN-out/attention GEMMs and MXFP8 dynamic (block size 32) for the sensitive
+  FFN fc1 and GDN linear layers; conditioning, embeddings, output heads, and
+  norms stay in bf16. The NVFP4/MXFP8 configs come from torchao's *prototype*
+  mx_formats API, so this needs a recent `torchao` and a Blackwell GPU
+  (sm_100+/sm_120); older torchao or older GPUs degrade to int4 weight-only +
+  int8 dynamic, and without torchao the DiT stays bf16. Baseline remains bf16
   mixed precision (`mixed_precision: bf16` in `sana_streaming_2b_720p.yaml`).
 - **uint8 frame I/O** (default): frames cross the PCIe bus as uint8 both
   directions — webcam frames upload as 1 byte/channel and are
