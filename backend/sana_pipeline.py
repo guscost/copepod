@@ -25,12 +25,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # SANA-Streaming environment setup (must run before importing torch/diffusion).
-# xFormers ships with the Sana environment and stays enabled: flash-attn takes
-# precedence in the V2V softmax attention, and xFormers drives the V2V
-# cross-attention packing path. Set DISABLE_XFORMERS=1 to force it off.
-os.environ.setdefault("DISABLE_XFORMERS", "0")
+# Native PyTorch SDPA (FlashAttention backend) is preferred over xFormers: on
+# Blackwell (sm_120) the core SDPA flash kernels are the maintained path, while
+# xFormers lags new GPU archs. flash-attn still takes precedence in the V2V
+# softmax attention where it is wired in directly. Set DISABLE_XFORMERS=0 to
+# re-enable xFormers (e.g. for the V2V cross-attention packing path).
+os.environ.setdefault("DISABLE_XFORMERS", "1")
 os.environ.setdefault("USE_CHUNKWISE_GDN", "1")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Persistent kernel/engine caches so Triton compiles, Inductor artifacts, and
+# TensorRT engine builds are paid once across server restarts.
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/.cache/sana_inductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/.cache/sana_triton"))
 
 BACKEND_ROOT = Path(__file__).resolve().parent
 # The Sana repo is not tracked in this repository; it must exist locally.
@@ -40,6 +46,7 @@ if (SANA_ROOT / "diffusion").is_dir() and str(SANA_ROOT) not in sys.path:
     sys.path.insert(0, str(SANA_ROOT))
 
 try:
+    import numpy as np
     import torch
     import torchvision.transforms as T
     from PIL import Image, ImageOps
@@ -73,6 +80,12 @@ except ModuleNotFoundError as e:
         "  3. Install the server deps:  pip install -r backend/requirements.txt"
     ) from e
 
+# Force the native SDPA FlashAttention backend on CUDA (the default, but make
+# it explicit; SDPA still falls back to mem-efficient/math per-op when flash
+# can't handle a shape, e.g. arbitrary attention masks).
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
 STREAMING_REPO_ID = "Efficient-Large-Model/SANA-Streaming"
 DEFAULT_PROMPT = "Replace all corporate logos, and all still or video advertising, with black squares"
 CONFIG_PATH = BACKEND_ROOT / "sana_streaming_2b_720p.yaml"
@@ -99,14 +112,23 @@ MAX_PENDING_FRAMES = 48
 # enable with a comma-separated list, e.g. TENSORRT=vae,text_encoder (or
 # TENSORRT=all). Requires a torch-tensorrt build matching the installed
 # torch/CUDA. The DiT is deliberately not compilable this way: its stateful
-# KV cache and Triton GDN kernels don't survive graph capture. A component
-# whose compiled call ever fails stays on eager for the rest of the session.
+# KV cache and Triton GDN kernels don't survive graph capture (an AOT
+# dynamo compile with the KV cache as an explicit input would need the
+# sampler restructured to be purely functional). A component whose compiled
+# call ever fails stays on eager for the rest of the session.
 TENSORRT_COMPONENTS = {c.strip() for c in os.environ.get("TENSORRT", "").split(",") if c.strip()}
 if TENSORRT_COMPONENTS - {"vae", "text_encoder", "all"}:
     raise SystemExit(
         f"Unknown TENSORRT component(s): {sorted(TENSORRT_COMPONENTS - {'vae', 'text_encoder', 'all'})} "
         "(expected a comma-separated subset of: vae, text_encoder, all)"
     )
+
+# TorchAO microscaling quantization of the DiT (opt-in, TORCHAO_QUANT=1).
+# Bulk FFN-out/attention GEMMs go to Blackwell NVFP4 weight-only (block size
+# 16); the sensitive FFN fc1 and GDN linear layers go to MXFP8 dynamic
+# activation + weight (block size 32). Conditioning, embeddings, output heads,
+# and norms stay in bf16. NVFP4 needs a Blackwell GPU (sm_100+/sm_120).
+TORCHAO_QUANT = os.environ.get("TORCHAO_QUANT", "0") == "1"
 
 _trt_logged: set[str] = set()
 
@@ -133,7 +155,26 @@ def _trt_compile(fn, component: str, label: str):
                 flush=True,
             )
         return fn
-    compiled = torch.compile(fn, backend="torch_tensorrt", dynamic=False)
+    # Mirror the recommended Blackwell (sm_120) dynamo settings: bf16 with fp8
+    # (and fp4 where the torch build exposes it) allowed, explicit typing,
+    # highest optimization/tactic-search level, CUDA graphs to cut WSL2/WDDM
+    # launch overhead, and a persistent engine cache so recompiles across
+    # restarts are skipped. fp8/fp4 execution for the DiT itself comes from
+    # the TorchAO microscaling path (TORCHAO_QUANT=1), not TensorRT.
+    enabled_precisions = {torch.bfloat16, torch.float8_e4m3fn}
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None:
+        enabled_precisions.add(fp4_dtype)
+    trt_options = {
+        "enabled_precisions": enabled_precisions,
+        "use_explicit_typing": True,
+        "optimization_level": 4,
+        "cudagraphs": True,
+        "cache_built_engines": True,
+        "reuse_cached_engines": True,
+        "engine_cache_dir": os.path.expanduser("~/.cache/sana_trt_engines"),
+    }
+    compiled = torch.compile(fn, backend="torch_tensorrt", dynamic=False, options=trt_options)
     failed = False
 
     @functools.wraps(fn)
@@ -156,6 +197,59 @@ def _trt_compile(fn, component: str, label: str):
         _trt_logged.add(component)
         print(f"[tensorrt] {component}: Torch-TensorRT enabled (compiles on first call)", flush=True)
     return wrapper
+
+
+def _sana_blackwell_filter(module: torch.nn.Module, fqn: str) -> bool:
+    """NVFP4 (block size 16) filter: bulk FFN-out/attention GEMMs only."""
+    if not isinstance(module, torch.nn.Linear):
+        return False
+    # Protect conditioning, embeddings, output heads, and GDN state projections
+    protected_tokens = ("t_embedder", "y_embedder", "proj_out", "gdn", "delta_net", "norm")
+    if any(tok in fqn.lower() for tok in protected_tokens):
+        return False
+    # Keep FFN input projections in higher precision to prevent temporal flicker
+    if "ffn.fc1" in fqn or "mlp.fc1" in fqn:
+        return False
+    return True
+
+
+def _mxfp8_filter(module: torch.nn.Module, fqn: str) -> bool:
+    """MXFP8 (block size 32) filter: sensitive FFN fc1 & GDN linear layers."""
+    return isinstance(module, torch.nn.Linear) and ("ffn.fc1" in fqn or "gdn" in fqn.lower())
+
+
+def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
+    """Apply TorchAO microscaling quantization to the DiT in place."""
+    try:
+        from torchao.quantization import (
+            MXFP8DynamicActivationMXFP8WeightConfig,
+            NVFP4WeightOnlyConfig,
+            quantize_,
+        )
+    except ImportError:
+        print(
+            "[quant] torchao not installed; DiT stays in bf16 "
+            "(pip install torchao to enable TORCHAO_QUANT=1)",
+            flush=True,
+        )
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (10, 0):
+        print(
+            f"[quant] NVFP4 needs a Blackwell GPU (sm_100+); this is sm_{major}{minor}; "
+            "DiT stays in bf16",
+            flush=True,
+        )
+        return
+    try:
+        # 1. Bulk FFN output/attention GEMMs -> Blackwell NVFP4 (block size 16)
+        quantize_(model, NVFP4WeightOnlyConfig(), filter_fn=_sana_blackwell_filter)
+        # 2. Sensitive FFN fc1 & GDN linear layers -> MXFP8 (block size 32)
+        quantize_(model, MXFP8DynamicActivationMXFP8WeightConfig(), filter_fn=_mxfp8_filter)
+    except Exception as e:
+        print(f"[quant] TorchAO quantization failed ({e}); continuing anyway", flush=True)
+        return
+    print("[quant] DiT quantized: NVFP4 weight-only (bulk GEMMs) + MXFP8 dynamic (fc1/GDN)", flush=True)
 
 
 @dataclass
@@ -341,6 +435,11 @@ class SANAStreamingPipeline:
         self.latent_h = None
         self.latent_w = None
         self.flow_shift = None
+        # Pinned-memory staging buffers for uint8 frame I/O (created lazily).
+        self._pinned_in = None  # [H, W, 3] uint8 double buffer for H2D uploads
+        self._pinned_in_events = None
+        self._pinned_in_idx = 0
+        self._pinned_out = None  # [C, T, H, W] uint8 buffer for D2H readback
         self._load_model()
 
     def _load_model(self):
@@ -450,6 +549,9 @@ class SANAStreamingPipeline:
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval().to(self.weight_dtype)
 
+        if TORCHAO_QUANT:
+            _quantize_dit_microscaling(self.model)
+
         print("[load] Weights loaded. Encoding prompt (first GPU compute)...", flush=True)
         self.set_prompt(self.prompt)
 
@@ -494,11 +596,33 @@ class SANAStreamingPipeline:
         self.negative_embeds, self.negative_mask = self._encode_prompt("", use_chi_prompt=False)
 
     def preprocess_frame(self, image: Image.Image) -> torch.Tensor:
-        """Resize+center-crop to the 720p bucket and normalize to [-1, 1]."""
+        """Resize+center-crop to the 720p bucket and normalize to [-1, 1].
+
+        Uploads the frame to the GPU as raw uint8 (1 byte/channel instead of
+        float32's 4 — 75% less PCIe traffic) through a pinned-memory double
+        buffer so the DMA transfer runs asynchronously, then casts/normalizes
+        to bfloat16 on the GPU before the Causal VAE encoder.
+        """
         image = ImageOps.fit(image.convert("RGB"), (FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.BICUBIC)
-        tensor = T.functional.to_tensor(image)
-        tensor = T.functional.normalize(tensor, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        return tensor.to(self.device)
+        if self.device.type != "cuda":
+            tensor = T.functional.to_tensor(image)
+            tensor = T.functional.normalize(tensor, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            return tensor.to(self.device)
+        if self._pinned_in is None:
+            self._pinned_in = [
+                torch.empty(FRAME_HEIGHT, FRAME_WIDTH, 3, dtype=torch.uint8, pin_memory=True)
+                for _ in range(2)
+            ]
+            self._pinned_in_events = [torch.cuda.Event() for _ in range(2)]
+        idx = self._pinned_in_idx
+        self._pinned_in_idx ^= 1
+        buf = self._pinned_in[idx]
+        # Don't overwrite the buffer until a previous async H2D from it finished.
+        self._pinned_in_events[idx].synchronize()
+        buf.copy_(torch.from_numpy(np.array(image)))
+        frame = buf.to(self.device, non_blocking=True).permute(2, 0, 1)
+        self._pinned_in_events[idx].record()
+        return frame.to(torch.bfloat16) / 127.5 - 1.0
 
     def vae_encode_stream(self, video_chunk: torch.Tensor, reset_cache: bool) -> torch.Tensor:
         """Causal streaming VAE encode with the normalization vae_encode() applies.
@@ -516,13 +640,26 @@ class SANAStreamingPipeline:
         latents_std = vae.latents_std.view(1, -1, 1, 1, 1).to(z.device, z.dtype)
         return ((z - latents_mean) * vae.config.scaling_factor / latents_std).to(self.vae_dtype)
 
-    @staticmethod
-    def pixels_to_jpegs(video: torch.Tensor) -> list[bytes]:
-        """Convert a decoded ``[B, C, T, H, W]`` tensor in [-1, 1] to JPEG frames."""
-        video = torch.clamp(127.5 * video[0].float() + 127.5, 0, 255).to(torch.uint8).cpu()
+    def pixels_to_jpegs(self, video: torch.Tensor) -> list[bytes]:
+        """Convert a decoded ``[B, C, T, H, W]`` tensor in [-1, 1] to JPEG frames.
+
+        Downcasts to uint8 on the GPU before the D2H readback (1 byte/channel —
+        75% less PCIe traffic than float32, 50% less than bf16), staged through
+        a pinned-memory buffer so the copy is a true async DMA transfer.
+        """
+        video_u8 = ((video[0].float() + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+        if video_u8.device.type == "cuda":
+            if self._pinned_out is None or self._pinned_out.shape != video_u8.shape:
+                self._pinned_out = torch.empty(video_u8.shape, dtype=torch.uint8, pin_memory=True)
+            self._pinned_out.copy_(video_u8, non_blocking=True)
+            # The JPEG encode below reads the buffer, so this D2H must complete.
+            torch.cuda.current_stream().synchronize()
+            video_u8 = self._pinned_out
+        else:
+            video_u8 = video_u8.cpu()
         frames = []
-        for t in range(video.shape[1]):
-            img = T.functional.to_pil_image(video[:, t])
+        for t in range(video_u8.shape[1]):
+            img = T.functional.to_pil_image(video_u8[:, t])
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=JPEG_QUALITY)
             frames.append(buf.getvalue())

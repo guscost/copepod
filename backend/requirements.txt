@@ -25,7 +25,10 @@ transformers>=4.45
 # Optional accelerators for BACKEND_MODE=sana — do NOT install from here
 # blindly; versions must match the torch/CUDA stack from Sana's
 # environment_setup.sh (which already installs xformers + flash-attn):
-#   xformers==0.0.36           # memory-efficient attention (on by default; DISABLE_XFORMERS=1 opts out)
+#   xformers==0.0.36           # memory-efficient attention (OFF by default — native SDPA is
+#                              # preferred; re-enable with DISABLE_XFORMERS=0)
+#   torchao                    # TorchAO microscaling (TORCHAO_QUANT=1): NVFP4 weight-only +
+#                              # MXFP8 dynamic quantization of the DiT on Blackwell (sm_100+)
 # Experimental TensorRT path (TENSORRT=vae,text_encoder; GDINO_TRT=1 for the
 # detect backend): install the torch-tensorrt build matching this torch/CUDA
 # stack, e.g.

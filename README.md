@@ -210,17 +210,33 @@ Status of the usual inference optimizations in this stack:
   with `DISABLE_FLASH_ATTN=1`. Note the DiT's flash path runs in bf16, so it
   bypasses the config's `fp32_attention: true` (which only applies to the
   GDN/SDPA paths).
-- **xFormers** (default): installed by Sana's `environment_setup.sh`; drives
-  the V2V cross-attention packing path and is the fallback when flash-attn
-  is absent. Force off with `DISABLE_XFORMERS=1` (the previous behavior).
+- **SDPA over xFormers** (default): the V2V paths run on native PyTorch SDPA
+  (FlashAttention backend, explicitly enabled) since the core kernels are the
+  maintained path on Blackwell (sm_120). Re-enable xFormers — which drives the
+  V2V cross-attention packing path — with `DISABLE_XFORMERS=0`.
 - **TensorRT** (experimental, opt-in): `TENSORRT=vae,text_encoder` (or
   `TENSORRT=all`) compiles those components with Torch-TensorRT on first
   use, with automatic permanent fallback to eager if a compiled call fails.
-  Requires a torch-tensorrt build matching the installed torch/CUDA (see
+  Uses the Blackwell dynamo settings: explicit typing, optimization level 4,
+  CUDA graphs (cuts WSL 2/WDDM launch overhead), and a persistent engine
+  cache in `~/.cache/sana_trt_engines` (Inductor/Triton caches live in
+  `~/.cache/sana_inductor` / `~/.cache/sana_triton`). Requires a
+  torch-tensorrt build matching the installed torch/CUDA (see
   `backend/requirements.txt`). The DiT is not compilable this way — its
   stateful KV cache and Triton GDN kernels don't survive graph capture.
-- **Quantization**: bf16 mixed precision (`mixed_precision: bf16` in
-  `sana_streaming_2b_720p.yaml`); no fp8/int8 path for this pipeline.
+- **TorchAO microscaling quantization** (experimental, opt-in, Blackwell
+  only): `TORCHAO_QUANT=1` quantizes the DiT with NVFP4 weight-only (block
+  size 16) for bulk FFN-out/attention GEMMs and MXFP8 dynamic (block size 32)
+  for the sensitive FFN fc1 and GDN linear layers; conditioning, embeddings,
+  output heads, and norms stay in bf16. Requires `torchao` and a Blackwell
+  GPU (sm_100+/sm_120); falls back to bf16 otherwise. Baseline remains bf16
+  mixed precision (`mixed_precision: bf16` in `sana_streaming_2b_720p.yaml`).
+- **uint8 frame I/O** (default): frames cross the PCIe bus as uint8 both
+  directions — webcam frames upload as 1 byte/channel and are
+  cast/normalized to bf16 on the GPU before the Causal VAE encoder; VAE
+  decoder output is downcast to uint8 on the GPU before the D2H readback.
+  Both directions stage through pinned-memory buffers (double-buffered on
+  input) so DMA transfers run asynchronously.
 - **Persistent model loading** (already in place): the backend loads once in
   the FastAPI lifespan and is reused across all connections.
 
