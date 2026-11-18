@@ -222,8 +222,8 @@ def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
     """Apply TorchAO microscaling quantization to the DiT in place."""
     try:
         from torchao.quantization import (
-            MXFP8DynamicActivationMXFP8WeightConfig,
-            NVFP4WeightOnlyConfig,
+            Int8DynamicActivationInt8WeightConfig,
+            Int4WeightOnlyConfig,
             quantize_,
         )
     except ImportError:
@@ -243,9 +243,9 @@ def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
         return
     try:
         # 1. Bulk FFN output/attention GEMMs -> Blackwell NVFP4 (block size 16)
-        quantize_(model, NVFP4WeightOnlyConfig(), filter_fn=_sana_blackwell_filter)
+        quantize_(model, Int4WeightOnlyConfig(), filter_fn=_sana_blackwell_filter)
         # 2. Sensitive FFN fc1 & GDN linear layers -> MXFP8 (block size 32)
-        quantize_(model, MXFP8DynamicActivationMXFP8WeightConfig(), filter_fn=_mxfp8_filter)
+        quantize_(model, Int8DynamicActivationInt8WeightConfig(), filter_fn=_mxfp8_filter)
     except Exception as e:
         print(f"[quant] TorchAO quantization failed ({e}); continuing anyway", flush=True)
         return
