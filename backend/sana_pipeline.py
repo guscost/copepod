@@ -209,8 +209,11 @@ def _sana_blackwell_filter(module: torch.nn.Module, fqn: str) -> bool:
     # layers that fail this (e.g. small gate projections) stay in bf16.
     if module.in_features % 16 or module.out_features % 16:
         return False
-    # Protect conditioning, embeddings, output heads, and GDN state projections
-    protected_tokens = ("t_embedder", "y_embedder", "proj_out", "gdn", "delta_net", "norm")
+    # Protect conditioning, embeddings, output heads, GDN state projections,
+    # and the camera-control QKV projections (proj_cam) — Sana fuses those at
+    # runtime with torch.cat([q.weight, k.weight, v.weight]), and NVFP4Tensor
+    # doesn't implement aten.cat.
+    protected_tokens = ("t_embedder", "y_embedder", "proj_out", "gdn", "delta_net", "norm", "proj_cam")
     if any(tok in fqn.lower() for tok in protected_tokens):
         return False
     # Keep FFN input projections in higher precision to prevent temporal flicker
