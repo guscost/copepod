@@ -779,6 +779,7 @@ class StreamSession:
         self.encoder_fresh = True  # reset the VAE encoder cache on next encode
         self.stream_started = False
         self.frames_seen = 0  # input frames received, for FRAME_SKIP pacing
+        self._chunk_times = deque(maxlen=20)  # denoise+decode wall time per chunk
 
     def drop_oldest_if_overwhelmed(self) -> int:
         excess = len(self.frame_buffer) - MAX_PENDING_FRAMES
@@ -832,8 +833,10 @@ class StreamSession:
                 device=p.device,
                 generator=self.generator,
             )
+            t_chunk = time.time()
             denoised = self.sampler.sample_chunk(noise, chunk, steps=DENOISE_STEPS)
             pixels = self.decoder.decode_chunk(denoised.to(p.vae_dtype))
+            self._chunk_times.append(time.time() - t_chunk)
             if not self.stream_started:
                 print(
                     f"[stream] first chunk denoised+decoded in {time.time() - t0:.1f}s; "
@@ -841,7 +844,18 @@ class StreamSession:
                     f"{pixels.max().item():.2f}/{pixels.mean().item():.2f}",
                     flush=True,
                 )
-            self.output_queue.extend(p.pixels_to_jpegs(pixels))
+            jpegs = p.pixels_to_jpegs(pixels)
+            self.output_queue.extend(jpegs)
+            if self.stream_started and len(self._chunk_times) == self._chunk_times.maxlen:
+                avg = sum(self._chunk_times) / len(self._chunk_times)
+                # Sustainable output fps: pixel frames per chunk / seconds per chunk.
+                fps = len(jpegs) / avg
+                print(
+                    f"[stream] throughput: {avg * 1000:.0f} ms/chunk, ~{fps:.1f} fps sustainable "
+                    f"(dropped frames mean input rate exceeds this)",
+                    flush=True,
+                )
+                self._chunk_times.clear()
             self.stream_started = True
 
     def next_output(self) -> bytes:
