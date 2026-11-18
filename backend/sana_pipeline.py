@@ -205,6 +205,10 @@ def _sana_blackwell_filter(module: torch.nn.Module, fqn: str) -> bool:
     """NVFP4 (block size 16) filter: bulk FFN-out/attention GEMMs only."""
     if not isinstance(module, torch.nn.Linear):
         return False
+    # NVFP4 kernels require both weight dims divisible by the 16-wide block;
+    # layers that fail this (e.g. small gate projections) stay in bf16.
+    if module.in_features % 16 or module.out_features % 16:
+        return False
     # Protect conditioning, embeddings, output heads, and GDN state projections
     protected_tokens = ("t_embedder", "y_embedder", "proj_out", "gdn", "delta_net", "norm")
     if any(tok in fqn.lower() for tok in protected_tokens):
@@ -217,7 +221,12 @@ def _sana_blackwell_filter(module: torch.nn.Module, fqn: str) -> bool:
 
 def _mxfp8_filter(module: torch.nn.Module, fqn: str) -> bool:
     """MXFP8 (block size 32) filter: sensitive FFN fc1 & GDN linear layers."""
-    return isinstance(module, torch.nn.Linear) and ("ffn.fc1" in fqn or "gdn" in fqn.lower())
+    return (
+        isinstance(module, torch.nn.Linear)
+        and ("ffn.fc1" in fqn or "gdn" in fqn.lower())
+        # MX blocks tile the reduction dim by 32; skip layers that don't fit.
+        and module.in_features % 32 == 0
+    )
 
 
 def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
