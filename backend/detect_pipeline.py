@@ -109,6 +109,13 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   frame (0.6). Zero-shot models occasionally "detect" the
                   whole screen as an advertisement; without this cap the
                   entire frame flickers black for a frame.
+  MIN_BOX_AREA    Reject detections covering less than this fraction of the frame
+                  (0.0). May be used to suppress detector noise and specks.
+  MIN_BOX_WIDTH   Minimum detected box width in pixels (0, disabled).
+  MIN_BOX_HEIGHT  Minimum detected box height in pixels (0, disabled).
+  JPEG_QUALITY    Encoded output JPEG/WebP quality (80).
+  OUTPUT_FORMAT   Output encoding: "jpeg" (default) or "webp" (smaller at the
+                  same quality, but may encode more slowly).
   MIN_HITS        A track must be detected this many times before its box is
                   rendered (2). Suppresses one-frame false positives.
   TRACK_TTL       Keep rendering a track's box for this many frames after the
@@ -165,10 +172,16 @@ DETECT_EVERY = max(1, int(os.environ.get("DETECT_EVERY", "1")))
 FILL_MODE = os.environ.get("FILL_MODE", "black")  # black|white|blur|debug
 BOX_DILATE = float(os.environ.get("BOX_DILATE", "0.1"))
 MAX_BOX_AREA = float(os.environ.get("MAX_BOX_AREA", "0.6"))
+MIN_BOX_AREA = float(os.environ.get("MIN_BOX_AREA", "0.0"))
+MIN_BOX_WIDTH = max(0.0, float(os.environ.get("MIN_BOX_WIDTH", "0")))
+MIN_BOX_HEIGHT = max(0.0, float(os.environ.get("MIN_BOX_HEIGHT", "0")))
 MIN_HITS = max(1, int(os.environ.get("MIN_HITS", "2")))
 TRACK_TTL = max(0, int(os.environ.get("TRACK_TTL", "5")))
 TRACK_SMOOTH = float(os.environ.get("TRACK_SMOOTH", "0.6"))
-JPEG_QUALITY = 80
+JPEG_QUALITY = max(1, min(100, int(os.environ.get("JPEG_QUALITY", "80"))))
+OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "jpeg").strip().lower()
+if OUTPUT_FORMAT not in ("jpeg", "webp"):
+    raise SystemExit("Unknown OUTPUT_FORMAT (expected 'jpeg' or 'webp')")
 # ByteTrack ids are per-model; offset each model's ids by this stride so
 # tracks from different fine-tuned checkpoints can't collide in the shared
 # track state.
@@ -793,8 +806,14 @@ class DetectorPipeline:
         """Fuse one frame's raw detections into the persistent track state."""
         h, w = frame_shape[:2]
         for track_id, x1, y1, x2, y2, conf, label in detections:
-            if (x2 - x1) * (y2 - y1) > MAX_BOX_AREA * w * h:
+            box_w, box_h = x2 - x1, y2 - y1
+            box_area = box_w * box_h
+            if box_area > MAX_BOX_AREA * w * h:
                 continue  # whole-frame false positive; would black out the screen
+            if box_area < MIN_BOX_AREA * w * h:
+                continue
+            if box_w < MIN_BOX_WIDTH or box_h < MIN_BOX_HEIGHT:
+                continue
             if track_id is None:
                 track_id = self._synthetic_id
                 self._synthetic_id -= 1
@@ -851,7 +870,10 @@ class DetectorPipeline:
 
         out = self._composite(frame)
         buf = io.BytesIO()
-        Image.fromarray(out).save(buf, format="JPEG", quality=JPEG_QUALITY)
+        if OUTPUT_FORMAT == "webp":
+            Image.fromarray(out).save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+        else:
+            Image.fromarray(out).save(buf, format="JPEG", quality=JPEG_QUALITY)
         return buf.getvalue()
 
     def _composite(self, frame: np.ndarray) -> np.ndarray:

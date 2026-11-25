@@ -147,6 +147,9 @@
         // right size.
         const STREAM_WIDTH = 1280;
         const STREAM_HEIGHT = 720;
+        const STREAM_PARAMS = new URLSearchParams(location.search);
+        const TARGET_FPS = Math.max(1, Math.min(60, Number(STREAM_PARAMS.get('fps') || 24)));
+        const INPUT_QUALITY = Math.max(0.1, Math.min(0.95, Number(STREAM_PARAMS.get('quality') || 0.55)));
 
         // Offscreen canvas for frame extraction
         const hiddenCanvas = document.createElement('canvas');
@@ -166,6 +169,7 @@
         let sentCount = 0;
         let gotFirstResponse = false;
         let lastFpsUpdate = Date.now();
+        let lastSendTime = 0;
 
         function updateStatus(msg) {
             statusEl.textContent = msg;
@@ -254,9 +258,11 @@
         function streamLoop() {
             if (!streamActive) return;
             
+            const now = performance.now();
+            const sendInterval = 1000 / TARGET_FPS;
             if (video.readyState >= video.HAVE_CURRENT_DATA && 
                 ws && ws.readyState === WebSocket.OPEN && 
-                !isProcessing) {
+                !isProcessing && now - lastSendTime >= sendInterval) {
                 
                 // Center-crop the webcam frame to 16:9 before scaling, so a
                 // non-16:9 camera (e.g. 4:3) isn't stretched.
@@ -271,6 +277,7 @@
                     sy = (vh - sh) / 2;
                 }
                 hiddenCtx.drawImage(video, sx, sy, sw, sh, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
+                lastSendTime = now;
                 
                 hiddenCanvas.toBlob((blob) => {
                     if (blob) {
@@ -281,7 +288,7 @@
                             updateStatus(`Connected | sent ${sentCount} frames, waiting for first output...`);
                         }
                     }
-                }, 'image/jpeg', 0.7);
+                }, 'image/jpeg', INPUT_QUALITY);
             }
             
             requestAnimationFrame(streamLoop);

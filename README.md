@@ -119,6 +119,15 @@ FILL_MODE=blur     # black | white | blur | debug (debug draws boxes+labels, no 
 
 # Detect every Nth frame, reuse boxes in between (default 1)
 DETECT_EVERY=2
+
+# Optional minimum size filters (disabled by default)
+MIN_BOX_AREA=0.0001       # fraction of frame area
+MIN_BOX_WIDTH=8           # pixels
+MIN_BOX_HEIGHT=8          # pixels
+
+# Compress output more aggressively (jpeg default 80)
+JPEG_QUALITY=65
+OUTPUT_FORMAT=jpeg        # jpeg (default) | webp
 ```
 
 With a zero-shot model, the "Apply Prompt" box doubles as a class editor:
@@ -181,6 +190,17 @@ python -m http.server 8080
 3. Click "Start Stream" to begin webcam capture
 4. Enter a processing prompt and click "Apply Prompt"
 5. Watch the real-time processed output
+
+For the webcam-to-server side, the frontend defaults to 24 FPS and JPEG input
+quality 0.55. These can be tuned in the URL, for example:
+
+```
+frontend/index.html?fps=24&quality=0.45
+```
+
+Lower `quality` reduces upload bandwidth; `fps` is capped at 60 and is
+backpressure-controlled, so the browser does not enqueue a new frame while the
+previous frame is still processing.
 
 ## Features
 
