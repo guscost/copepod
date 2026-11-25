@@ -153,8 +153,18 @@
         const INPUT_QUALITY = Math.max(0.1, Math.min(0.95, Number(STREAM_PARAMS.get('quality') || 0.55)));
         const requestedInputFormat = String(STREAM_PARAMS.get('format') || 'h264').toLowerCase();
         const INPUT_FORMAT = ['h264', 'jpeg', 'webp'].includes(requestedInputFormat) ? requestedInputFormat : 'h264';
-        const H264_OUTPUT_SUPPORTED = INPUT_FORMAT === 'h264' && 'MediaSource' in window &&
-            MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01f"');
+        const H264_OUTPUT_MIME = (() => {
+            if (INPUT_FORMAT !== 'h264' || !('MediaSource' in window)) return null;
+            for (const mime of [
+                'video/mp4; codecs="avc1.42c01f"',
+                'video/mp4; codecs="avc1.42e01f"',
+                'video/mp4; codecs="avc1.4d401f"'
+            ]) {
+                if (MediaSource.isTypeSupported(mime)) return mime;
+            }
+            return null;
+        })();
+        const H264_OUTPUT_SUPPORTED = H264_OUTPUT_MIME !== null;
 
         // Offscreen canvas for frame extraction
         const hiddenCanvas = document.createElement('canvas');
@@ -242,22 +252,34 @@
                         h264Output.src = URL.createObjectURL(mediaSource);
                         h264Output.style.display = 'block';
                         document.getElementById('outputCanvas').style.display = 'none';
+                        const h264Messages = [];
+                        ws.onmessage = (event) => {
+                            if (event.data instanceof ArrayBuffer) h264Messages.push(event.data);
+                        };
                         mediaSource.addEventListener('sourceopen', () => {
-                            const mime = 'video/mp4; codecs="avc1.42e01f"';
-                            if (!MediaSource.isTypeSupported(mime)) {
+                            let sourceBuffer;
+                            try {
+                                sourceBuffer = mediaSource.addSourceBuffer(H264_OUTPUT_MIME);
+                            } catch (err) {
+                                console.error('Failed to create H264 output buffer', err);
                                 h264Output.style.display = 'none';
                                 document.getElementById('outputCanvas').style.display = 'block';
                                 return;
                             }
-                            const sourceBuffer = mediaSource.addSourceBuffer(mime);
                             sourceBuffer.mode = 'segments';
-                            const pending = [];
+                            const pending = h264Messages;
                             const drain = () => {
-                                if (!sourceBuffer.updating && pending.length) {
+                                if (sourceBuffer.updating || !pending.length) return;
+                                try {
                                     sourceBuffer.appendBuffer(pending.shift());
+                                } catch (err) {
+                                    console.error('Failed to append H264 output', err);
                                 }
                             };
                             sourceBuffer.addEventListener('updateend', drain);
+                            sourceBuffer.addEventListener('error', (err) => {
+                                console.error('H264 output buffer error', err);
+                            });
                             ws.onmessage = (event) => {
                                 if (event.data instanceof ArrayBuffer) {
                                     pending.push(event.data);
@@ -273,6 +295,7 @@
                                     }
                                 }
                             };
+                            drain();
                         }, { once: true });
                     }
                     streamActive = true;

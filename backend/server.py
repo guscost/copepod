@@ -80,6 +80,12 @@ class H264OutputEncoder:
             bufsize=0,
         )
         threading.Thread(target=self._read_output, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read_stderr(self):
+        for raw in iter(self.process.stderr.readline, b""):
+            if raw:
+                print(f"[h264 output] {raw.decode(errors='replace').strip()}", flush=True)
 
     def _read_output(self):
         while self.process.poll() is None:
@@ -124,8 +130,14 @@ class H264FrameDecoder:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        threading.Thread(target=self._read_stderr, daemon=True).start()
         self.thread = threading.Thread(target=self._read_output, daemon=True)
         self.thread.start()
+
+    def _read_stderr(self):
+        for raw in iter(self.process.stderr.readline, b""):
+            if raw:
+                print(f"[h264 input] {raw.decode(errors='replace').strip()}", flush=True)
 
     def _read_output(self):
         pending = bytearray()
