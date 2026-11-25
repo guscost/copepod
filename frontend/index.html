@@ -269,8 +269,23 @@
                             sourceBuffer.mode = 'segments';
                             const pending = h264Messages;
                             const drain = () => {
-                                if (sourceBuffer.updating || !pending.length) return;
+                                if (sourceBuffer.updating) return;
                                 try {
+                                    if (sourceBuffer.buffered.length) {
+                                        const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+                                        const current = h264Output.currentTime;
+                                        if (end - current > 4) {
+                                            const removeThrough = Math.max(0, end - 2);
+                                            sourceBuffer.remove(0, removeThrough);
+                                            return;
+                                        }
+                                    }
+                                } catch (err) {
+                                    console.error('Failed to trim H264 output buffer', err);
+                                }
+                                if (!pending.length) return;
+                                try {
+                                    if (pending.length > 32) pending.splice(0, pending.length - 32);
                                     sourceBuffer.appendBuffer(pending.shift());
                                 } catch (err) {
                                     console.error('Failed to append H264 output', err);
@@ -394,7 +409,7 @@
                 if (h264Encoder) {
                     if (h264Encoder.encodeQueueSize < 4) {
                         const frame = new VideoFrame(hiddenCanvas, { timestamp: Math.round(now * 1000) });
-                        h264Encoder.encode(frame, { keyFrame: sentCount > 0 && sentCount % TARGET_FPS === 0 });
+                        h264Encoder.encode(frame, { keyFrame: sentCount % TARGET_FPS === 0 });
                         frame.close();
                         sentCount++;
                         if (!gotFirstResponse) {

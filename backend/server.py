@@ -117,7 +117,7 @@ class H264FrameDecoder:
     """Decode Annex-B H264 chunks from WebCodecs into JPEG frames."""
 
     def __init__(self, width: int = 1280, height: int = 720):
-        self.frames = queue.Queue(maxsize=4)
+        self.frames = queue.Queue(maxsize=2)
         self.process = subprocess.Popen(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -167,7 +167,7 @@ class H264FrameDecoder:
                         pass
                     self.frames.put_nowait(frame)
 
-    def decode(self, chunk: bytes, timeout: float = 0.25):
+    def decode(self, chunk: bytes, timeout: float = 0.02):
         if not chunk:
             return None
         try:
