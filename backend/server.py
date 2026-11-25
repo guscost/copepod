@@ -120,9 +120,10 @@ class H264FrameDecoder:
         self.frames = queue.Queue(maxsize=4)
         self.process = subprocess.Popen(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
-                "-flags", "low_delay", "-f", "h264", "-i", "pipe:0",
-                "-an", "-vsync", "0", "-f", "image2pipe", "-vcodec", "mjpeg",
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-flags", "low_delay", "-err_detect", "ignore_err",
+                "-f", "h264", "-i", "pipe:0",
+                "-an", "-f", "image2pipe", "-vcodec", "mjpeg",
                 "-q:v", "2", "pipe:1",
             ],
             stdin=subprocess.PIPE,
