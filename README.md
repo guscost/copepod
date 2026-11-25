@@ -207,11 +207,13 @@ upload than JPEG:
 frontend/index.html?fps=24&format=h264
 ```
 
-H264 is now the default upload and output format. WebCodecs encodes webcam
-frames and MediaSource decodes the server's low-latency fragmented H264 stream.
-Use `format=webp` or `format=jpeg` for browsers without WebCodecs H264 support.
-Both require `ffmpeg` on the PATH for server-side decode/encode. Set
-`STREAM_OUTPUT_FORMAT=webp` or `jpeg` to disable H264 output independently.
+WebP input is the default because direct WebSocket frame delivery has the
+lowest latency and avoids two FFmpeg transcode stages. Use `format=h264` to
+opt into WebCodecs upload and MediaSource output, or `output=h264` to keep
+WebP/JPEG input with H264 output. H264 requires `ffmpeg` on the PATH and is
+best used only when bandwidth reduction is more important than immediate
+start and minimum latency. Set `STREAM_OUTPUT_FORMAT=webp` or `jpeg` to
+disable H264 output independently.
 
 ## Features
 

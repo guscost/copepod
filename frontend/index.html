@@ -151,10 +151,11 @@
         const STREAM_PARAMS = new URLSearchParams(location.search);
         const TARGET_FPS = Math.max(1, Math.min(60, Number(STREAM_PARAMS.get('fps') || 24)));
         const INPUT_QUALITY = Math.max(0.1, Math.min(0.95, Number(STREAM_PARAMS.get('quality') || 0.55)));
-        const requestedInputFormat = String(STREAM_PARAMS.get('format') || 'h264').toLowerCase();
-        const INPUT_FORMAT = ['h264', 'jpeg', 'webp'].includes(requestedInputFormat) ? requestedInputFormat : 'h264';
+        const requestedInputFormat = String(STREAM_PARAMS.get('format') || 'webp').toLowerCase();
+        const INPUT_FORMAT = ['h264', 'jpeg', 'webp'].includes(requestedInputFormat) ? requestedInputFormat : 'webp';
+        const requestedOutputFormat = String(STREAM_PARAMS.get('output') || (INPUT_FORMAT === 'h264' ? 'h264' : 'jpeg')).toLowerCase();
         const H264_OUTPUT_MIME = (() => {
-            if (INPUT_FORMAT !== 'h264' || !('MediaSource' in window)) return null;
+            if (requestedOutputFormat !== 'h264' || !('MediaSource' in window)) return null;
             for (const mime of [
                 'video/mp4; codecs="avc1.42c01f"',
                 'video/mp4; codecs="avc1.42e01f"',
@@ -319,7 +320,7 @@
                 
                 ws.onmessage = async (event) => {
                     const blob = event.data instanceof ArrayBuffer
-                        ? new Blob([event.data], { type: 'image/jpeg' })
+                        ? new Blob([event.data])
                         : event.data;
                     const img = new Image();
                     img.src = URL.createObjectURL(blob);
