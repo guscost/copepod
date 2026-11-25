@@ -200,7 +200,18 @@ frontend/index.html?fps=24&quality=0.45
 
 Lower `quality` reduces upload bandwidth; `fps` is capped at 60 and is
 backpressure-controlled, so the browser does not enqueue a new frame while the
-previous frame is still processing.
+previous frame is still processing. Input frames default to WebP for a smaller
+upload than JPEG:
+
+```
+frontend/index.html?fps=24&format=h264
+```
+
+H264 is now the default upload and output format. WebCodecs encodes webcam
+frames and MediaSource decodes the server's low-latency fragmented H264 stream.
+Use `format=webp` or `format=jpeg` for browsers without WebCodecs H264 support.
+Both require `ffmpeg` on the PATH for server-side decode/encode. Set
+`STREAM_OUTPUT_FORMAT=webp` or `jpeg` to disable H264 output independently.
 
 ## Features
 

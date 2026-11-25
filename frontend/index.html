@@ -130,6 +130,7 @@
             <div class="video-panel">
                 <h3>Output (Processed)</h3>
                 <button class="fullscreen-btn" id="fullscreenBtn">⛶ Fullscreen</button>
+                <video id="h264Output" autoplay muted playsinline style="display:none"></video>
                 <canvas id="outputCanvas"></canvas>
             </div>
         </div>
@@ -150,6 +151,8 @@
         const STREAM_PARAMS = new URLSearchParams(location.search);
         const TARGET_FPS = Math.max(1, Math.min(60, Number(STREAM_PARAMS.get('fps') || 24)));
         const INPUT_QUALITY = Math.max(0.1, Math.min(0.95, Number(STREAM_PARAMS.get('quality') || 0.55)));
+        const requestedInputFormat = String(STREAM_PARAMS.get('format') || 'h264').toLowerCase();
+        const INPUT_FORMAT = ['h264', 'jpeg', 'webp'].includes(requestedInputFormat) ? requestedInputFormat : 'h264';
 
         // Offscreen canvas for frame extraction
         const hiddenCanvas = document.createElement('canvas');
@@ -170,6 +173,8 @@
         let gotFirstResponse = false;
         let lastFpsUpdate = Date.now();
         let lastSendTime = 0;
+        let h264Encoder = null;
+        let h264Output = null;
 
         function updateStatus(msg) {
             statusEl.textContent = msg;
@@ -187,11 +192,77 @@
                 });
                 video.srcObject = stream;
                 
+                if (INPUT_FORMAT === 'h264' && 'VideoEncoder' in window) {
+                    const codecSupport = await VideoEncoder.isConfigSupported({
+                        codec: 'avc1.42001f',
+                        width: STREAM_WIDTH,
+                        height: STREAM_HEIGHT,
+                        bitrate: 2_500_000,
+                        framerate: TARGET_FPS,
+                        latencyMode: 'realtime',
+                        avc: { format: 'annexb' }
+                    });
+                    if (codecSupport.supported) {
+                        h264Encoder = new VideoEncoder({
+                            output: (chunk) => {
+                                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                                const bytes = new Uint8Array(chunk.byteLength);
+                                chunk.copyTo(bytes);
+                                const packet = new Uint8Array(bytes.length + 1);
+                                packet[0] = 0x48; // H264 Annex B chunk
+                                packet.set(bytes, 1);
+                                ws.send(packet);
+                            },
+                            error: (err) => console.error('H264 encoder error', err)
+                        });
+                        h264Encoder.configure({
+                            codec: 'avc1.42001f',
+                            width: STREAM_WIDTH,
+                            height: STREAM_HEIGHT,
+                            bitrate: 2_500_000,
+                            framerate: TARGET_FPS,
+                            latencyMode: 'realtime',
+                            avc: { format: 'annexb' }
+                        });
+                    }
+                }
+
                 // Connect WebSocket
                 ws = new WebSocket(`ws://${SERVER}/ws/stream`);
+                ws.binaryType = 'arraybuffer';
                 
                 ws.onopen = () => {
                     updateStatus('Connected to server');
+                    if (INPUT_FORMAT === 'h264' && 'MediaSource' in window) {
+                        const mediaSource = new MediaSource();
+                        h264Output = document.getElementById('h264Output');
+                        h264Output.src = URL.createObjectURL(mediaSource);
+                        h264Output.style.display = 'block';
+                        document.getElementById('outputCanvas').style.display = 'none';
+                        mediaSource.addEventListener('sourceopen', () => {
+                            const mime = 'video/mp4; codecs="avc1.42001f"';
+                            if (!MediaSource.isTypeSupported(mime)) {
+                                h264Output.style.display = 'none';
+                                document.getElementById('outputCanvas').style.display = 'block';
+                                return;
+                            }
+                            const sourceBuffer = mediaSource.addSourceBuffer(mime);
+                            sourceBuffer.mode = 'segments';
+                            const pending = [];
+                            const drain = () => {
+                                if (!sourceBuffer.updating && pending.length) {
+                                    sourceBuffer.appendBuffer(pending.shift());
+                                }
+                            };
+                            sourceBuffer.addEventListener('updateend', drain);
+                            ws.onmessage = (event) => {
+                                if (event.data instanceof ArrayBuffer) {
+                                    pending.push(event.data);
+                                    drain();
+                                }
+                            };
+                        }, { once: true });
+                    }
                     streamActive = true;
                     requestAnimationFrame(streamLoop);
                 };
@@ -245,6 +316,10 @@
 
         function stopStream() {
             streamActive = false;
+            if (h264Encoder) {
+                h264Encoder.close();
+                h264Encoder = null;
+            }
             if (ws) {
                 ws.close();
                 ws = null;
@@ -278,6 +353,19 @@
                 }
                 hiddenCtx.drawImage(video, sx, sy, sw, sh, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
                 lastSendTime = now;
+
+                if (h264Encoder) {
+                    if (h264Encoder.encodeQueueSize < 4) {
+                        const frame = new VideoFrame(hiddenCanvas, { timestamp: Math.round(now * 1000) });
+                        h264Encoder.encode(frame, { keyFrame: sentCount > 0 && sentCount % TARGET_FPS === 0 });
+                        frame.close();
+                        sentCount++;
+                        if (!gotFirstResponse) {
+                            updateStatus(`Connected | sent ${sentCount} H264 frames, waiting for first output...`);
+                        }
+                    }
+                    return requestAnimationFrame(streamLoop);
+                }
                 
                 hiddenCanvas.toBlob((blob) => {
                     if (blob) {
@@ -288,7 +376,7 @@
                             updateStatus(`Connected | sent ${sentCount} frames, waiting for first output...`);
                         }
                     }
-                }, 'image/jpeg', INPUT_QUALITY);
+                }, INPUT_FORMAT === 'webp' ? 'image/webp' : 'image/jpeg', INPUT_QUALITY);
             }
             
             requestAnimationFrame(streamLoop);

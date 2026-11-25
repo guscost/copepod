@@ -103,7 +103,10 @@ DENOISE_STEPS = int(os.environ.get("DENOISE_STEPS", "4"))  # long_streaming defa
 # Process only every Nth input frame; skipped frames are answered with the
 # last output, lowering the sustained processing framerate.
 FRAME_SKIP = max(1, int(os.environ.get("FRAME_SKIP", "1")))
-JPEG_QUALITY = 80
+JPEG_QUALITY = max(1, min(100, int(os.environ.get("JPEG_QUALITY", "80"))))
+OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "jpeg").strip().lower()
+if OUTPUT_FORMAT not in ("jpeg", "webp"):
+    raise SystemExit("Unknown OUTPUT_FORMAT (expected 'jpeg' or 'webp')")
 # If the GPU falls behind by more than this many unprocessed input frames,
 # drop the oldest ones (a jump cut) instead of growing latency without bound.
 MAX_PENDING_FRAMES = 48
@@ -693,7 +696,7 @@ class SANAStreamingPipeline:
         return ((z - latents_mean) * vae.config.scaling_factor / latents_std).to(self.vae_dtype)
 
     def pixels_to_jpegs(self, video: torch.Tensor) -> list[bytes]:
-        """Convert a decoded ``[B, C, T, H, W]`` tensor in [-1, 1] to JPEG frames.
+        """Convert a decoded ``[B, C, T, H, W]`` tensor in [-1, 1] to JPEG/WebP frames.
 
         Downcasts to uint8 on the GPU before the D2H readback (1 byte/channel —
         75% less PCIe traffic than float32, 50% less than bf16), staged through
@@ -713,7 +716,10 @@ class SANAStreamingPipeline:
         for t in range(video_u8.shape[1]):
             img = T.functional.to_pil_image(video_u8[:, t])
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=JPEG_QUALITY)
+            if OUTPUT_FORMAT == "webp":
+                img.save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+            else:
+                img.save(buf, format="JPEG", quality=JPEG_QUALITY)
             frames.append(buf.getvalue())
         return frames
 
@@ -752,7 +758,11 @@ class VaeStreamingDecoder:
 
 def _make_placeholder_jpeg() -> bytes:
     buf = io.BytesIO()
-    Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT)).save(buf, format="JPEG", quality=JPEG_QUALITY)
+    image = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT))
+    if OUTPUT_FORMAT == "webp":
+        image.save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+    else:
+        image.save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
 
 

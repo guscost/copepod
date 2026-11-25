@@ -24,6 +24,9 @@ Architecture notes:
 
 import asyncio
 import os
+import queue
+import subprocess
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -49,6 +52,131 @@ gpu_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 
 connected_clients: set[WebSocket] = set()
 producer: WebSocket | None = None
+h264_decoder = None
+h264_output_encoder = None
+STREAM_OUTPUT_FORMAT = os.environ.get("STREAM_OUTPUT_FORMAT", "h264").strip().lower()
+if STREAM_OUTPUT_FORMAT not in ("h264", "jpeg", "webp"):
+    raise SystemExit("Unknown STREAM_OUTPUT_FORMAT (expected 'h264', 'jpeg', or 'webp')")
+
+
+class H264OutputEncoder:
+    """Encode processed JPEG frames as a low-latency fragmented H264 MP4 stream."""
+
+    def __init__(self, loop, fps: int = 24):
+        self.loop = loop
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-f", "image2pipe",
+                "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
+                "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+                "-profile:v", "baseline", "-level", "3.1",
+                "-g", str(fps), "-keyint_min", str(fps), "-bf", "0",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        threading.Thread(target=self._read_output, daemon=True).start()
+
+    def _read_output(self):
+        while self.process.poll() is None:
+            chunk = self.process.stdout.read(65536)
+            if not chunk:
+                break
+            asyncio.run_coroutine_threadsafe(broadcast(chunk), self.loop)
+
+    def encode(self, jpeg_bytes: bytes):
+        try:
+            self.process.stdin.write(jpeg_bytes)
+            self.process.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+class H264FrameDecoder:
+    """Decode Annex-B H264 chunks from WebCodecs into JPEG frames."""
+
+    def __init__(self, width: int = 1280, height: int = 720):
+        self.frames = queue.Queue(maxsize=4)
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
+                "-flags", "low_delay", "-f", "h264", "-i", "pipe:0",
+                "-an", "-vsync", "0", "-f", "image2pipe", "-vcodec", "mjpeg",
+                "-q:v", "2", "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.thread = threading.Thread(target=self._read_output, daemon=True)
+        self.thread.start()
+
+    def _read_output(self):
+        pending = bytearray()
+        while self.process.poll() is None:
+            chunk = self.process.stdout.read(65536)
+            if not chunk:
+                break
+            pending.extend(chunk)
+            while True:
+                start = pending.find(b"\xff\xd8")
+                if start < 0:
+                    break
+                end = pending.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if len(pending) > 8 * 1024 * 1024:
+                        pending.clear()
+                    break
+                frame = bytes(pending[start:end + 2])
+                del pending[:end + 2]
+                try:
+                    self.frames.put_nowait(frame)
+                except queue.Full:
+                    try:
+                        self.frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.frames.put_nowait(frame)
+
+    def decode(self, chunk: bytes, timeout: float = 0.25):
+        if not chunk:
+            return None
+        try:
+            self.process.stdin.write(chunk)
+            self.process.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            return None
+        try:
+            return self.frames.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
 
 @asynccontextmanager
@@ -96,7 +224,7 @@ async def broadcast(payload: bytes):
 
 @app.websocket("/ws/stream")
 async def websocket_endpoint(websocket: WebSocket):
-    global producer
+    global producer, h264_decoder, h264_output_encoder
     await websocket.accept()
     connected_clients.add(websocket)
     print(f"Client connected. Total clients: {len(connected_clients)}")
@@ -108,9 +236,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if producer is None:
                 producer = websocket
+                h264_decoder = H264FrameDecoder()
+                if STREAM_OUTPUT_FORMAT == "h264":
+                    h264_output_encoder = H264OutputEncoder(loop)
                 print("Producer connected.")
             if websocket is not producer:
                 continue  # viewer connection: ignore inbound frames
+
+            if data[:1] == b"H":
+                data = h264_decoder.decode(data[1:])
+                if data is None:
+                    continue
 
             try:
                 output = await loop.run_in_executor(gpu_worker, backend.process_frame, data)
@@ -119,7 +255,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.close(code=1011)
                 break
 
-            await broadcast(output)
+            if h264_output_encoder is not None:
+                h264_output_encoder.encode(output)
+            else:
+                await broadcast(output)
 
     except WebSocketDisconnect:
         print("Client disconnected.")
@@ -127,6 +266,12 @@ async def websocket_endpoint(websocket: WebSocket):
         connected_clients.discard(websocket)
         if websocket is producer:
             producer = None
+            if h264_decoder is not None:
+                h264_decoder.close()
+                h264_decoder = None
+            if h264_output_encoder is not None:
+                h264_output_encoder.close()
+                h264_output_encoder = None
             await loop.run_in_executor(gpu_worker, backend.reset)
             print("Producer disconnected; stream state reset.")
         print(f"Client removed. Total clients: {len(connected_clients)}")

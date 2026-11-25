@@ -847,7 +847,7 @@ class DetectorPipeline:
         ]
 
     def process_frame(self, data: bytes) -> bytes:
-        """Detect logos/ads in one JPEG frame, return the blanked JPEG."""
+        """Detect logos/ads in one JPEG/WebP frame and return an encoded frame."""
         frame = np.array(Image.open(io.BytesIO(data)).convert("RGB"))  # writable copy
         self._frames += 1
 
