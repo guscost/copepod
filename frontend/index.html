@@ -153,6 +153,8 @@
         const INPUT_QUALITY = Math.max(0.1, Math.min(0.95, Number(STREAM_PARAMS.get('quality') || 0.55)));
         const requestedInputFormat = String(STREAM_PARAMS.get('format') || 'h264').toLowerCase();
         const INPUT_FORMAT = ['h264', 'jpeg', 'webp'].includes(requestedInputFormat) ? requestedInputFormat : 'h264';
+        const H264_OUTPUT_SUPPORTED = INPUT_FORMAT === 'h264' && 'MediaSource' in window &&
+            MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01f"');
 
         // Offscreen canvas for frame extraction
         const hiddenCanvas = document.createElement('canvas');
@@ -194,7 +196,7 @@
                 
                 if (INPUT_FORMAT === 'h264' && 'VideoEncoder' in window) {
                     const codecSupport = await VideoEncoder.isConfigSupported({
-                        codec: 'avc1.42001f',
+                        codec: 'avc1.42e01f',
                         width: STREAM_WIDTH,
                         height: STREAM_HEIGHT,
                         bitrate: 2_500_000,
@@ -216,7 +218,7 @@
                             error: (err) => console.error('H264 encoder error', err)
                         });
                         h264Encoder.configure({
-                            codec: 'avc1.42001f',
+                            codec: 'avc1.42e01f',
                             width: STREAM_WIDTH,
                             height: STREAM_HEIGHT,
                             bitrate: 2_500_000,
@@ -228,19 +230,20 @@
                 }
 
                 // Connect WebSocket
-                ws = new WebSocket(`ws://${SERVER}/ws/stream`);
+                const outputParam = H264_OUTPUT_SUPPORTED ? 'h264' : 'jpeg';
+                ws = new WebSocket(`ws://${SERVER}/ws/stream?output=${outputParam}`);
                 ws.binaryType = 'arraybuffer';
                 
                 ws.onopen = () => {
                     updateStatus('Connected to server');
-                    if (INPUT_FORMAT === 'h264' && 'MediaSource' in window) {
+                    if (H264_OUTPUT_SUPPORTED) {
                         const mediaSource = new MediaSource();
                         h264Output = document.getElementById('h264Output');
                         h264Output.src = URL.createObjectURL(mediaSource);
                         h264Output.style.display = 'block';
                         document.getElementById('outputCanvas').style.display = 'none';
                         mediaSource.addEventListener('sourceopen', () => {
-                            const mime = 'video/mp4; codecs="avc1.42001f"';
+                            const mime = 'video/mp4; codecs="avc1.42e01f"';
                             if (!MediaSource.isTypeSupported(mime)) {
                                 h264Output.style.display = 'none';
                                 document.getElementById('outputCanvas').style.display = 'block';
@@ -259,6 +262,15 @@
                                 if (event.data instanceof ArrayBuffer) {
                                     pending.push(event.data);
                                     drain();
+                                    gotFirstResponse = true;
+                                    frameCount++;
+                                    const now = Date.now();
+                                    if (now - lastFpsUpdate > 1000) {
+                                        const fps = frameCount * 1000 / (now - lastFpsUpdate);
+                                        updateStatus(`Connected | ${fps.toFixed(1)} FPS`);
+                                        frameCount = 0;
+                                        lastFpsUpdate = now;
+                                    }
                                 }
                             };
                         }, { once: true });
@@ -268,7 +280,9 @@
                 };
                 
                 ws.onmessage = async (event) => {
-                    const blob = event.data;
+                    const blob = event.data instanceof ArrayBuffer
+                        ? new Blob([event.data], { type: 'image/jpeg' })
+                        : event.data;
                     const img = new Image();
                     img.src = URL.createObjectURL(blob);
                     

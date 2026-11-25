@@ -237,7 +237,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if producer is None:
                 producer = websocket
                 h264_decoder = H264FrameDecoder()
-                if STREAM_OUTPUT_FORMAT == "h264":
+                requested_output = websocket.query_params.get("output", "h264")
+                if STREAM_OUTPUT_FORMAT == "h264" and requested_output == "h264":
                     h264_output_encoder = H264OutputEncoder(loop)
                 print("Producer connected.")
             if websocket is not producer:
