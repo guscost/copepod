@@ -235,6 +235,39 @@ def _mxfp8_filter(module: torch.nn.Module, fqn: str) -> bool:
     )
 
 
+def _find_runtime_weight_fused_linears(model: torch.nn.Module) -> set[str]:
+    """FQNs of Linear layers whose weights are manipulated (cat/slice) at runtime.
+
+    Sana's fused GDN forward concatenates q/k/v projection weights per call
+    (``_prepare_fused_gdn_inputs`` in diffusion/model/ops), and quantized
+    tensor subclasses (NVFP4Tensor/MXTensor) only implement the mm/linear op
+    set — ``aten.cat`` on them raises mid-stream. The fqns carry no "gdn"
+    token (they look like ``blocks.N.attn.v``), so detect them structurally:
+    GDN attention classes keep q/k/v and the gate/head projections as direct
+    children. Camera-GDN variants also fuse q_proj_cam/k_proj_cam/v_proj_cam
+    weights, while q/k can be Conv1d in other variants and are therefore not
+    quantized by these Linear filters.
+    """
+    protected = set()
+    fused_child_names = (
+        "q",
+        "k",
+        "v",
+        "beta_proj",
+        "gate_proj",
+        "q_proj_cam",
+        "k_proj_cam",
+        "v_proj_cam",
+    )
+    for mod_name, mod in model.named_modules():
+        if "GDN" not in type(mod).__name__:
+            continue
+        for child_name, child in mod.named_children():
+            if isinstance(child, torch.nn.Linear) and child_name in fused_child_names:
+                protected.add(f"{mod_name}.{child_name}" if mod_name else child_name)
+    return protected
+
+
 def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
     """Apply TorchAO microscaling quantization to the DiT in place.
 
@@ -292,11 +325,23 @@ def _quantize_dit_microscaling(model: torch.nn.Module) -> None:
         nvfp4_config = Int4WeightOnlyConfig()
         mxfp8_config = Int8DynamicActivationInt8WeightConfig()
 
+    fused_linears = _find_runtime_weight_fused_linears(model)
+    if fused_linears:
+        print(f"[quant] protecting {len(fused_linears)} weight-fused GDN linear(s) from quantization", flush=True)
+
     try:
         # 1. Bulk FFN output/attention GEMMs -> NVFP4 weight-only (block size 16)
-        quantize_(model, nvfp4_config, filter_fn=_sana_blackwell_filter)
+        quantize_(
+            model,
+            nvfp4_config,
+            filter_fn=lambda m, fqn: fqn not in fused_linears and _sana_blackwell_filter(m, fqn),
+        )
         # 2. Sensitive FFN fc1 & GDN linear layers -> MXFP8 dynamic (block size 32)
-        quantize_(model, mxfp8_config, filter_fn=_mxfp8_filter)
+        quantize_(
+            model,
+            mxfp8_config,
+            filter_fn=lambda m, fqn: fqn not in fused_linears and _mxfp8_filter(m, fqn),
+        )
     except Exception as e:
         print(f"[quant] TorchAO quantization failed ({e}); continuing anyway", flush=True)
         return
