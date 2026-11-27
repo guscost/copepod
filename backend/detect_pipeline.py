@@ -123,6 +123,19 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   detection briefly drops out.
   TRACK_SMOOTH    EMA weight for new box coordinates (0.6). Lower values
                   smooth jitter more but lag behind fast-moving ads.
+  BOTTOM_COVERAGE_THRESHOLD
+                  If the union of retrieved boxes covers this fraction or
+                  more of the bottom half, treat it as a false positive and
+                  do not block (0.8).
+  FULLSCREEN_AD_CLASSIFIER
+                  Hugging Face CLIP model used for binary full-screen-ad
+                  classification (default openai/clip-vit-base-patch32).
+                  Set to off/0/none to disable.
+  FULLSCREEN_AD_CONF
+                  Probability required to classify a frame as a full-screen ad
+                  (0.70).
+  FULLSCREEN_AD_EVERY
+                  Run full-screen classification every Nth frame (1).
 """
 
 import io
@@ -178,6 +191,12 @@ MIN_BOX_HEIGHT = max(0.0, float(os.environ.get("MIN_BOX_HEIGHT", "0")))
 MIN_HITS = max(1, int(os.environ.get("MIN_HITS", "2")))
 TRACK_TTL = max(0, int(os.environ.get("TRACK_TTL", "5")))
 TRACK_SMOOTH = float(os.environ.get("TRACK_SMOOTH", "0.6"))
+BOTTOM_COVERAGE_THRESHOLD = float(os.environ.get("BOTTOM_COVERAGE_THRESHOLD", "0.8"))
+FULLSCREEN_AD_CLASSIFIER = os.environ.get(
+    "FULLSCREEN_AD_CLASSIFIER", "openai/clip-vit-base-patch32"
+).strip()
+FULLSCREEN_AD_CONF = float(os.environ.get("FULLSCREEN_AD_CONF", "0.70"))
+FULLSCREEN_AD_EVERY = max(1, int(os.environ.get("FULLSCREEN_AD_EVERY", "1")))
 JPEG_QUALITY = max(1, min(100, int(os.environ.get("JPEG_QUALITY", "80"))))
 OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "jpeg").strip().lower()
 if OUTPUT_FORMAT not in ("jpeg", "webp"):
@@ -439,6 +458,9 @@ class DetectorPipeline:
         #              "last_seen", "hits"}
         self._tracks = {}
         self._synthetic_id = -1  # fallback ids if the tracker returns none
+        self._fullscreen_active = False
+        self._fullscreen_classifier = None
+        self._fullscreen_classifier_failed = False
         self._frames = 0
         self._detects = 0
         self._detect_ms = 0.0
@@ -635,6 +657,7 @@ class DetectorPipeline:
     def reset(self):
         """Clear tracker + box state (called when the producer disconnects)."""
         self._tracks = {}
+        self._fullscreen_active = False
         self._frames = 0
         if self.is_gdino:
             self._iou_tracker.reset()
@@ -642,6 +665,77 @@ class DetectorPipeline:
             # Drop the predictors so ByteTrack starts from a clean slate.
             for _, model in self.models:
                 model.predictor = None
+
+    def _init_fullscreen_classifier(self):
+        if FULLSCREEN_AD_CLASSIFIER.lower() in ("", "0", "off", "none"):
+            self._fullscreen_classifier_failed = True
+            return
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+            self._fullscreen_processor = CLIPProcessor.from_pretrained(
+                FULLSCREEN_AD_CLASSIFIER
+            )
+            self._fullscreen_classifier = CLIPModel.from_pretrained(
+                FULLSCREEN_AD_CLASSIFIER
+            ).to(self.device)
+            self._fullscreen_classifier.eval()
+            print(
+                f"[detect] full-screen ad classifier: {FULLSCREEN_AD_CLASSIFIER}",
+                flush=True,
+            )
+        except Exception as exc:
+            self._fullscreen_classifier_failed = True
+            print(
+                f"[detect] full-screen ad classifier unavailable; continuing: {exc}",
+                flush=True,
+            )
+
+    def _classify_fullscreen_ad(self, frame: np.ndarray):
+        if self._fullscreen_classifier_failed:
+            return False, 0.0
+        if self._fullscreen_classifier is None:
+            self._init_fullscreen_classifier()
+        if self._fullscreen_classifier is None:
+            return False, 0.0
+
+        import torch
+
+        try:
+            image = Image.fromarray(frame)
+            prompts = [
+                "a full-screen advertisement or sponsored video",
+                "normal video content without a full-screen advertisement",
+            ]
+            inputs = self._fullscreen_processor(
+                text=prompts,
+                images=image,
+                return_tensors="pt",
+                padding=True,
+            ).to(self.device)
+            with torch.inference_mode():
+                logits = self._fullscreen_classifier(**inputs).logits_per_image
+                probability = logits.softmax(dim=1)[0, 0].item()
+            return probability >= FULLSCREEN_AD_CONF, probability
+        except Exception as exc:
+            self._fullscreen_classifier_failed = True
+            print(
+                f"[detect] full-screen ad classification failed; disabling: {exc}",
+                flush=True,
+            )
+            return False, 0.0
+
+    def _set_fullscreen_ad(self, frame_shape, conf):
+        h, w = frame_shape[:2]
+        self._tracks = {
+            -1: {
+                "box": np.array([0.0, 0.0, float(w), float(h)]),
+                "conf": conf,
+                "label": "fullscreen advertisement",
+                "last_seen": self._frames,
+                "hits": max(MIN_HITS, 1),
+            }
+        }
+        self._fullscreen_active = True
 
     def _detect(self, frame: np.ndarray):
         if self.is_gdino:
@@ -805,6 +899,26 @@ class DetectorPipeline:
     def _update_tracks(self, detections, frame_shape):
         """Fuse one frame's raw detections into the persistent track state."""
         h, w = frame_shape[:2]
+
+        # A detector can mistake a dense lower-screen caption/control area for
+        # a cluster of ads. Use the union of raw boxes, not their sum, so
+        # overlapping detections do not inflate the false-positive score.
+        bottom_mask = np.zeros((h, w), dtype=np.uint8)
+        for _, x1, y1, x2, y2, _, _ in detections:
+            ix1 = int(max(0, min(w, x1)))
+            iy1 = int(max(h // 2, min(h, y1)))
+            ix2 = int(max(0, min(w, x2)))
+            iy2 = int(max(h // 2, min(h, y2)))
+            if ix2 > ix1 and iy2 > iy1:
+                bottom_mask[iy1:iy2, ix1:ix2] = 1
+        bottom_area = w * (h - h // 2)
+        bottom_coverage = float(bottom_mask.sum()) / max(bottom_area, 1)
+        if bottom_coverage >= BOTTOM_COVERAGE_THRESHOLD:
+            self._tracks = {}
+            if self.is_gdino:
+                self._iou_tracker.reset()
+            return
+
         for track_id, x1, y1, x2, y2, conf, label in detections:
             box_w, box_h = x2 - x1, y2 - y1
             box_area = box_w * box_h
@@ -851,11 +965,29 @@ class DetectorPipeline:
         frame = np.array(Image.open(io.BytesIO(data)).convert("RGB"))  # writable copy
         self._frames += 1
 
+        # Binary full-screen-ad classification runs before the object detector.
+        # A positive result becomes an immediate whole-screen box and skips the
+        # rest of this pipeline until the classifier clears it.
+        classify_fullscreen = (
+            (self._frames - 1) % FULLSCREEN_AD_EVERY == 0
+            and FULLSCREEN_AD_CLASSIFIER.lower() not in ("", "0", "off", "none")
+        )
+        if classify_fullscreen:
+            is_fullscreen, fullscreen_conf = self._classify_fullscreen_ad(frame)
+            if is_fullscreen:
+                self._set_fullscreen_ad(frame.shape, fullscreen_conf)
+            elif self._fullscreen_active:
+                self._fullscreen_active = False
+                self._tracks = {}
+
         # _frames is 1-based, so detect on frames 1, 1+N, 1+2N, ... (with
         # DETECT_EVERY=1 that is every frame). Also re-detect immediately
         # whenever no tracks are known, so new ads are boxed without waiting
-        # for the next scheduled detection frame.
-        if (self._frames - 1) % DETECT_EVERY == 0 or not self._tracks:
+        # for the next scheduled detection frame. An active full-screen ad
+        # bypasses object detection and tracking entirely.
+        if not self._fullscreen_active and (
+            (self._frames - 1) % DETECT_EVERY == 0 or not self._tracks
+        ):
             t0 = time.perf_counter()
             self._update_tracks(self._detect(frame), frame.shape)
             self._detects += 1

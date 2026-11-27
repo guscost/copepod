@@ -125,6 +125,16 @@ MIN_BOX_AREA=0.0001       # fraction of frame area
 MIN_BOX_WIDTH=8           # pixels
 MIN_BOX_HEIGHT=8          # pixels
 
+# False-positive screen: if bounding-box unions cover >=80% of the bottom half,
+# suppress blocking for that frame (the threshold is configurable)
+BOTTOM_COVERAGE_THRESHOLD=0.8
+
+# Binary CLIP pre-check: positive frames immediately receive a whole-screen box
+# and bypass object detection/tracking until the classifier clears them
+FULLSCREEN_AD_CLASSIFIER=openai/clip-vit-base-patch32
+FULLSCREEN_AD_CONF=0.70
+FULLSCREEN_AD_EVERY=1
+
 # Compress output more aggressively (jpeg default 80)
 JPEG_QUALITY=65
 OUTPUT_FORMAT=jpeg        # jpeg (default) | webp
