@@ -23,7 +23,7 @@ Open frontend/index.html, and start the webcam stream.
 Add `pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu132` (match your CUDA version), then run e.g. (for a 5090):
 
 ```
-DETECT_EVERY=4 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.3 GDINO_TEXT_THRESHOLD=0.5 GDINO_TRT=1 python server.py
+DETECT_EVERY=4 YOLO_MODEL=IDEA-Research/grounding-dino-tiny DETECT_CONF=0.2 GDINO_TEXT_THRESHOLD=0.2 GDINO_TRT=1 python server.py
 ```
 
 ## Modes
@@ -108,17 +108,17 @@ YOLO_MODEL=yolov8s-worldv2.pt                  # lightweight YOLO-World
 YOLO_MODEL=/path/to/logos.pt                   # fine-tuned YOLO (uses its trained classes)
 
 # Zero-shot classes (Grounding DINO / YOLO-World only)
-DETECT_CLASSES="corporate logo,advertising banner,sponsor logo"
+DETECT_CLASSES="advertisement,brand logo"
 
-# Confidence threshold (default 0.25; zero-shot scores run low — use ~0.15
+# Confidence threshold (default 0.2; zero-shot scores run low — use ~0.15
 # for Grounding DINO / YOLO-World); doubles as Grounding DINO's box threshold
-DETECT_CONF=0.3
+DETECT_CONF=0.2
 
 # Fill style for detected regions (default black)
 FILL_MODE=blur     # black | white | blur | debug (debug draws boxes+labels, no fill)
 
-# Detect every Nth frame, reuse boxes in between (default 1)
-DETECT_EVERY=2
+# Detect every Nth frame, reuse boxes in between (default 4)
+DETECT_EVERY=4
 
 # Optional minimum size filters (disabled by default)
 MIN_BOX_AREA=0.0001       # fraction of frame area
@@ -152,8 +152,8 @@ accurate than YOLO-World on ambiguous classes like "logo": fewer false
 positives, tighter boxes. Extras beyond the shared knobs:
 
 ```bash
-# Token-to-phrase matching threshold (default 0.25; DETECT_CONF is the box threshold)
-GDINO_TEXT_THRESHOLD=0.3
+# Token-to-phrase matching threshold (default 0.2; DETECT_CONF is the box threshold)
+GDINO_TEXT_THRESHOLD=0.2
 
 # Force full fp32 instead of the default fp16 autocast on CUDA
 GDINO_FP16=0

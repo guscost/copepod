@@ -43,11 +43,11 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
                   single-model only — select them with YOLO_MODEL.
   DETECT_CLASSES  Comma-separated zero-shot classes (YOLO-World / Grounding
                   DINO only).
-  DETECT_CONF     Confidence threshold (default 0.25; zero-shot models score
+  DETECT_CONF     Confidence threshold (default 0.2; zero-shot models score
                   conservatively — lower towards 0.15 for those, raise it if
                   false positives appear). Doubles as Grounding DINO's box
                   threshold.
-  GDINO_TEXT_THRESHOLD  Grounding DINO token-to-phrase threshold (0.25).
+  GDINO_TEXT_THRESHOLD  Grounding DINO token-to-phrase threshold (0.2).
   GDINO_FP16      Run Grounding DINO in fp16 on CUDA (default 1; set 0 to
                   force fp32). Eager runs under fp16 autocast, which keeps
                   fp32-only ops (LayerNorm, deformable-attention sampling,
@@ -99,7 +99,7 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
   GDINO_DEBUG   Log raw per-frame detection count and top scores before
                   tracking/filtering (default 0).
   DETECT_EVERY    Run the detector every Nth frame, reusing the previous
-                  boxes in between (default 1; raise on weaker GPUs).
+                  boxes in between (default 4; raise on weaker GPUs).
   FILL_MODE       black (default) | white | blur | debug
                   ("debug" draws boxes + labels and fills nothing — use it
                   while tuning classes and confidence).
@@ -158,12 +158,12 @@ BILLBOARD_YOLO = os.environ.get(
 BRAND_EYE_YOLO = os.environ.get(
     "BRAND_EYE_YOLO", "haydarkadioglu/brand-eye:brandeye.pt"
 )
-DEFAULT_CLASSES = "corporate logo,brand logo,advertisement,billboard,sponsor"
+DEFAULT_CLASSES = "advertisement,brand logo"
 DETECT_CLASSES = [
     c.strip() for c in os.environ.get("DETECT_CLASSES", DEFAULT_CLASSES).split(",") if c.strip()
 ]
-DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.25"))
-GDINO_TEXT_THRESHOLD = float(os.environ.get("GDINO_TEXT_THRESHOLD", "0.25"))
+DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.2"))
+GDINO_TEXT_THRESHOLD = float(os.environ.get("GDINO_TEXT_THRESHOLD", "0.2"))
 GDINO_FP16 = os.environ.get("GDINO_FP16", "1") != "0"
 GDINO_TRT = os.environ.get("GDINO_TRT", "0") != "0"
 # Precision the TensorRT engine is compiled at: fp16 (default when
@@ -181,7 +181,7 @@ GDINO_TRT_TORCH_OPS = {
     op.strip() for op in os.environ.get("GDINO_TRT_TORCH_OPS", "").split(",") if op.strip()
 }
 GDINO_DEBUG = os.environ.get("GDINO_DEBUG", "0") != "0"
-DETECT_EVERY = max(1, int(os.environ.get("DETECT_EVERY", "1")))
+DETECT_EVERY = max(1, int(os.environ.get("DETECT_EVERY", "4")))
 FILL_MODE = os.environ.get("FILL_MODE", "black")  # black|white|blur|debug
 BOX_DILATE = float(os.environ.get("BOX_DILATE", "0.1"))
 MAX_BOX_AREA = float(os.environ.get("MAX_BOX_AREA", "0.6"))
