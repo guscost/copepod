@@ -114,8 +114,10 @@ Selected with BACKEND_MODE=detect in server.py. Env knobs:
   MIN_BOX_WIDTH   Minimum detected box width in pixels (0, disabled).
   MIN_BOX_HEIGHT  Minimum detected box height in pixels (0, disabled).
   JPEG_QUALITY    Encoded output JPEG/WebP quality (80).
+  WEBP_METHOD     Pillow WebP compression effort (0 = fastest, 6 = smallest;
+                  default 0 for low-latency output).
   OUTPUT_FORMAT   Output encoding: "jpeg" (default) or "webp" (smaller at the
-                  same quality, but may encode more slowly).
+                  same quality). WebP encoding can be tuned with WEBP_METHOD.
   MIN_HITS        A track must be detected this many times before its box is
                   rendered (2). Suppresses one-frame false positives.
   TRACK_TTL       Keep rendering a track's box for this many frames after the
@@ -198,6 +200,7 @@ FULLSCREEN_AD_CLASSIFIER = os.environ.get(
 FULLSCREEN_AD_CONF = float(os.environ.get("FULLSCREEN_AD_CONF", "0.70"))
 FULLSCREEN_AD_EVERY = max(1, int(os.environ.get("FULLSCREEN_AD_EVERY", "1")))
 JPEG_QUALITY = max(1, min(100, int(os.environ.get("JPEG_QUALITY", "80"))))
+WEBP_METHOD = max(0, min(6, int(os.environ.get("WEBP_METHOD", "0"))))
 OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "jpeg").strip().lower()
 if OUTPUT_FORMAT not in ("jpeg", "webp"):
     raise SystemExit("Unknown OUTPUT_FORMAT (expected 'jpeg' or 'webp')")
@@ -1003,7 +1006,7 @@ class DetectorPipeline:
         out = self._composite(frame)
         buf = io.BytesIO()
         if OUTPUT_FORMAT == "webp":
-            Image.fromarray(out).save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+            Image.fromarray(out).save(buf, format="WEBP", quality=JPEG_QUALITY, method=WEBP_METHOD)
         else:
             Image.fromarray(out).save(buf, format="JPEG", quality=JPEG_QUALITY)
         return buf.getvalue()

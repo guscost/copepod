@@ -138,6 +138,7 @@ FULLSCREEN_AD_EVERY=1
 # Compress output more aggressively (jpeg default 80)
 JPEG_QUALITY=65
 OUTPUT_FORMAT=jpeg        # jpeg (default) | webp
+WEBP_METHOD=0             # 0 (fastest/default) through 6 (smallest, slower)
 ```
 
 With a zero-shot model, the "Apply Prompt" box doubles as a class editor:

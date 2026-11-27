@@ -104,6 +104,7 @@ DENOISE_STEPS = int(os.environ.get("DENOISE_STEPS", "4"))  # long_streaming defa
 # last output, lowering the sustained processing framerate.
 FRAME_SKIP = max(1, int(os.environ.get("FRAME_SKIP", "1")))
 JPEG_QUALITY = max(1, min(100, int(os.environ.get("JPEG_QUALITY", "80"))))
+WEBP_METHOD = max(0, min(6, int(os.environ.get("WEBP_METHOD", "0"))))
 OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "jpeg").strip().lower()
 if OUTPUT_FORMAT not in ("jpeg", "webp"):
     raise SystemExit("Unknown OUTPUT_FORMAT (expected 'jpeg' or 'webp')")
@@ -762,7 +763,7 @@ class SANAStreamingPipeline:
             img = T.functional.to_pil_image(video_u8[:, t])
             buf = io.BytesIO()
             if OUTPUT_FORMAT == "webp":
-                img.save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+                img.save(buf, format="WEBP", quality=JPEG_QUALITY, method=WEBP_METHOD)
             else:
                 img.save(buf, format="JPEG", quality=JPEG_QUALITY)
             frames.append(buf.getvalue())
@@ -805,7 +806,7 @@ def _make_placeholder_jpeg() -> bytes:
     buf = io.BytesIO()
     image = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT))
     if OUTPUT_FORMAT == "webp":
-        image.save(buf, format="WEBP", quality=JPEG_QUALITY, method=4)
+        image.save(buf, format="WEBP", quality=JPEG_QUALITY, method=WEBP_METHOD)
     else:
         image.save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
